@@ -1,5 +1,12 @@
 # pi-mono-ask-user-question
 
+## 1.8.0
+
+### Minor Changes
+
+- Split the form renderer into focused dialog, form, schema, and state modules while preserving the existing `ask_user_question` tool interface.
+- Add keyboard-navigation and text-wrapping test coverage, plus a package-level test command.
+
 ## 1.7.4
 
 ### Patch Changes
