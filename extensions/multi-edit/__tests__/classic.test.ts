@@ -88,6 +88,22 @@ describe("applyClassicEdits — multi edit, same file", () => {
 		});
 	});
 
+	test("replaces successive occurrences for repeated identical edits", async () => {
+		await withTmp(async (dir) => {
+			const file = join(dir, "a.txt");
+			await writeFile(file, "foo one\nfoo two\n");
+
+			const edits: EditItem[] = [
+				{ path: "a.txt", oldText: "foo", newText: "FOO" },
+				{ path: "a.txt", oldText: "foo", newText: "FOO" },
+			];
+			const results = await applyClassicEdits(edits, makeWorkspace(), dir);
+
+			assert.equal(results.every((result) => result.success), true);
+			assert.equal(await readFile(file, "utf-8"), "FOO one\nFOO two\n");
+		});
+	});
+
 	test("skips redundant duplicate edit when only one occurrence exists", async () => {
 		await withTmp(async (dir) => {
 			const file = join(dir, "a.txt");

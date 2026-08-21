@@ -1,5 +1,15 @@
 # pi-mono-all
 
+## 2.0.0
+
+### Major Changes
+
+- Bundle `pi-mono-multi-edit@2.0.0`, which keeps Pi's native `edit` tool and adds separate `multi_file_edit` and `apply_patch` tools for cross-file, repeated-occurrence, and patch workflows.
+- Bundle `pi-mono-ask-user-question@1.8.0` with a modular form renderer and expanded keyboard-navigation and wrapping coverage.
+- Bundle `pi-mono-usage@0.2.0` with Tools and Activity dashboard views.
+- Bundle `pi-mono-context-guard@1.8.0` with reliable read deduplication for relative paths and covered ranges.
+- Bundle `pi-mono-team-mode@2.5.0` with schema-v2 model catalogs, weighted selection, and startup-failure fallback.
+
 ## 1.5.1
 
 ### Patch Changes

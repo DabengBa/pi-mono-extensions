@@ -1,16 +1,9 @@
 /**
- * Multi-Edit Extension — replaces the built-in `edit` tool.
+ * Multi-file editing tools for pi.
  *
- * Supports all original parameters (path, oldText, newText) plus:
- * - `multi`: array of {path, oldText, newText} edits applied in sequence
- * - `patch`: Codex-style apply_patch payload
- *
- * When both top-level params and `multi` are provided, the top-level edit
- * is treated as an implicit first item prepended to the multi list.
- *
- * A preflight pass is performed before mutating files:
- * - multi/top-level mode: preflight via virtualized built-in edit tool
- * - patch mode: preflight by applying patch operations on a virtual filesystem
+ * Pi's native `edit` tool remains active for normal single-file edits. This
+ * extension adds only the capabilities that native edit does not provide:
+ * cross-file replacement batches and Codex-style patches.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -26,7 +19,7 @@ const editItemSchema = Type.Object(
     path: Type.Optional(
       Type.String({
         description:
-          "Path to the file to edit (relative or absolute). Inherits from top-level path if omitted.",
+          "Path to the file to edit (relative or absolute). Inherits from the top-level path when omitted.",
       }),
     ),
     oldText: Type.String({
@@ -39,176 +32,63 @@ const editItemSchema = Type.Object(
   { additionalProperties: false },
 );
 
-const classicEditSchema = Type.Object(
+export const multiFileEditSchema = Type.Object(
   {
     path: Type.Optional(
       Type.String({
-        description: "Path to the file to edit (relative or absolute)",
+        description: "Default path inherited by edits that omit path",
       }),
     ),
-    oldText: Type.Optional(
-      Type.String({
-        description: "Exact text to find and replace (must match exactly)",
-      }),
-    ),
-    newText: Type.Optional(
-      Type.String({ description: "New text to replace the old text with" }),
-    ),
-    multi: Type.Optional(
-      Type.Array(editItemSchema, {
-        description:
-          "Multiple edits to apply in sequence. Each item has path, oldText, and newText.",
-      }),
-    ),
-  },
-  { additionalProperties: false },
-);
-
-const patchEditSchema = Type.Object(
-  {
-    patch: Type.String({
+    edits: Type.Array(editItemSchema, {
+      minItems: 2,
       description:
-        "Codex-style apply_patch payload (*** Begin Patch ... *** End Patch). Do not provide path, oldText, newText, or multi when using patch.",
+        "Two or more exact replacements spanning multiple files or targeting repeated identical occurrences in one file. Repeat an identical edit entry once per occurrence to replace.",
     }),
   },
   { additionalProperties: false },
 );
 
-export const multiEditSchema = Type.Union([patchEditSchema, classicEditSchema], {
-  description:
-    "Choose exactly one editing mode: patch by itself, or classic path/oldText/newText/multi parameters without patch.",
-});
+export const applyPatchSchema = Type.Object(
+  {
+    patch: Type.String({
+      description:
+        "Codex-style patch payload delimited by *** Begin Patch and *** End Patch",
+    }),
+  },
+  { additionalProperties: false },
+);
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
-    name: "edit",
-    label: "edit",
+    name: "multi_file_edit",
+    label: "multi_file_edit",
     description:
-      "Edit files using exact replacement, multi-edit, or Codex-style patch mode. When using `patch`, do not provide `path`, `oldText`, `newText`, or `multi`.",
+      "Apply a preflighted batch of exact replacements across multiple files or to repeated identical occurrences in one file. Use native edit for ordinary unique same-file replacements.",
     promptSnippet:
-      "Edit a file by replacing exact text. The oldText must match exactly (including whitespace). Use this for precise, surgical edits.",
+      "Apply exact replacements across multiple files or repeated identical occurrences in one file",
     promptGuidelines: [
-      "Use edit for precise changes (old text must match exactly)",
-      "Use the `multi` parameter to apply multiple edits in a single tool call",
-      "Use the `patch` parameter for Codex-style multi-file / hunk-based edits",
-      "When using edit's `patch` parameter, do not provide `path`, `oldText`, `newText`, or `multi`",
+      "Use native edit for ordinary one-file changes whose oldText values are unique, including multiple disjoint replacements",
+      "Use multi_file_edit when exact replacements span multiple files and should be preflighted together",
+      "Use multi_file_edit instead of native edit when the same oldText must be replaced at multiple occurrences in one file; repeat the identical edit entry once per intended occurrence",
+      "Set a top-level path when several edits target the same file; individual edits may override it",
     ],
-    parameters: multiEditSchema,
+    parameters: multiFileEditSchema,
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const { path, oldText, newText, multi, patch } = params;
+      const edits: EditItem[] = params.edits.map((item) => ({
+        path: item.path ?? params.path ?? "",
+        oldText: item.oldText,
+        newText: item.newText,
+      }));
 
-      const hasAnyClassicParam =
-        path !== undefined ||
-        oldText !== undefined ||
-        newText !== undefined ||
-        multi !== undefined;
-      if (patch !== undefined && hasAnyClassicParam) {
-        throw new Error(
-          "The `patch` parameter is mutually exclusive with path/oldText/newText/multi.",
-        );
-      }
-
-      if (patch !== undefined) {
-        const ops = parsePatch(patch);
-
-        // Preflight on virtual filesystem before mutating real files.
-        await applyPatchOperations(
-          ops,
-          createVirtualWorkspace(ctx.cwd),
-          ctx.cwd,
-          signal,
-          { collectDiff: false },
-        );
-
-        // Apply for real.
-        const applied = await applyPatchOperations(
-          ops,
-          createRealWorkspace(pi),
-          ctx.cwd,
-          signal,
-          { collectDiff: true },
-        );
-        const summary = applied
-          .map((r, i) => `${i + 1}. ${r.message}`)
-          .join("\n");
-        const combinedDiff = applied
-          .filter((r) => r.diff)
-          .map((r) => `File: ${r.path}\n${r.diff}`)
-          .join("\n\n");
-        const firstChangedLine = applied.find(
-          (r) => r.firstChangedLine !== undefined,
-        )?.firstChangedLine;
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Applied patch with ${applied.length} operation(s).\n${summary}`,
-            },
-          ],
-          details: {
-            diff: combinedDiff,
-            firstChangedLine,
-          },
-        };
-      }
-
-      // Build classic edit list.
-      const edits: EditItem[] = [];
-      const hasTopLevel =
-        path !== undefined && oldText !== undefined && newText !== undefined;
-
-      if (hasTopLevel) {
-        edits.push({ path: path!, oldText: oldText!, newText: newText! });
-      } else if (
-        path !== undefined ||
-        oldText !== undefined ||
-        newText !== undefined
-      ) {
-        // When multi is present, only a bare top-level `path` (for inheritance) is allowed.
-        // Any other partial combination (e.g. path+oldText, oldText+newText) is an error.
-        const hasOnlyPath =
-          path !== undefined && oldText === undefined && newText === undefined;
-        if (!hasOnlyPath || multi === undefined) {
-          const missing: string[] = [];
-          if (path === undefined) missing.push("path");
-          if (oldText === undefined) missing.push("oldText");
-          if (newText === undefined) missing.push("newText");
-          throw new Error(
-            `Incomplete top-level edit: missing ${missing.join(", ")}. Provide all three (path, oldText, newText) or use only the multi parameter.`,
-          );
-        }
-        // path-only top-level with multi is fine — path is inherited below.
-      }
-
-      if (multi) {
-        for (const item of multi) {
-          edits.push({
-            path: item.path ?? path ?? "",
-            oldText: item.oldText,
-            newText: item.newText,
-          });
-        }
-      }
-
-      if (edits.length === 0) {
-        throw new Error(
-          "No edits provided. Supply path/oldText/newText, a multi array, or a patch.",
-        );
-      }
-
-      // Validate that every edit has a path.
       for (let i = 0; i < edits.length; i++) {
         if (!edits[i].path) {
           throw new Error(
-            `Edit ${i + 1} is missing a path. Provide a path on each multi item or set a top-level path to inherit.`,
+            `Edit ${i + 1} is missing a path. Provide a path on the edit or set a top-level path to inherit.`,
           );
         }
       }
 
-      // Preflight pass on virtual workspace before mutating real files.
-      // Uses sequential occurrence matching so same-file edits are resolved
-      // in file order (positional ordering).
       try {
         await applyClassicEdits(
           edits,
@@ -217,16 +97,11 @@ export default function (pi: ExtensionAPI) {
           signal,
           { collectDiff: false },
         );
-      } catch (err: any) {
-        throw new Error(
-          `Preflight failed before mutating files.\n${err.message ?? String(err)}`,
-        );
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Preflight failed before mutating files.\n${message}`);
       }
 
-      // Apply for real. `continueOnError` lets successful edits land even
-      // when a sibling fails; `rollbackOnError` restores files if an
-      // unexpected error (I/O, abort) breaks the batch mid-write.
-      const isBatch = edits.length > 1;
       const results = await applyClassicEdits(
         edits,
         createRealWorkspace(pi),
@@ -235,36 +110,22 @@ export default function (pi: ExtensionAPI) {
         {
           collectDiff: true,
           rollbackOnError: true,
-          continueOnError: isBatch,
+          continueOnError: edits.length > 1,
         },
       );
 
-      const succeeded = results.filter((r) => r?.success);
-      const failed = results.filter((r) => r && !r.success);
-
-      if (results.length === 1) {
-        const r = results[0];
-        return {
-          content: [{ type: "text" as const, text: r.message }],
-          details: {
-            diff: r.diff ?? "",
-            firstChangedLine: r.firstChangedLine,
-          },
-        };
-      }
-
-      const combinedDiff = results
-        .filter((r) => r?.diff)
-        .map((r) => r.diff)
-        .join("\n");
-
-      const firstChanged = results.find(
-        (r) => r?.firstChangedLine !== undefined,
-      )?.firstChangedLine;
+      const succeeded = results.filter((result) => result?.success);
+      const failed = results.filter((result) => result && !result.success);
       const summary = results
-        .map((r, i) => `${i + 1}. ${r.message}`)
+        .map((result, index) => `${index + 1}. ${result.message}`)
         .join("\n");
-
+      const combinedDiff = results
+        .filter((result) => result?.diff)
+        .map((result) => result.diff)
+        .join("\n");
+      const firstChangedLine = results.find(
+        (result) => result?.firstChangedLine !== undefined,
+      )?.firstChangedLine;
       const statusLine =
         failed.length > 0
           ? `Applied ${succeeded.length}/${results.length} edit(s). ${failed.length} failed:\n${summary}`
@@ -272,10 +133,62 @@ export default function (pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text" as const, text: statusLine }],
-        details: {
-          diff: combinedDiff,
-          firstChangedLine: firstChanged,
-        },
+        details: { diff: combinedDiff, firstChangedLine },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "apply_patch",
+    label: "apply_patch",
+    description:
+      "Apply a preflighted Codex-style patch that can add, update, or delete files. Use native edit for ordinary replacements.",
+    promptSnippet:
+      "Apply a Codex-style patch for coordinated add, update, or delete operations",
+    promptGuidelines: [
+      "Use native edit for ordinary single-file replacements",
+      "Use apply_patch for coordinated multi-file changes or file additions/deletions",
+      "Patch payloads must use *** Begin Patch and *** End Patch delimiters",
+    ],
+    parameters: applyPatchSchema,
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const operations = parsePatch(params.patch);
+
+      await applyPatchOperations(
+        operations,
+        createVirtualWorkspace(ctx.cwd),
+        ctx.cwd,
+        signal,
+        { collectDiff: false },
+      );
+
+      const applied = await applyPatchOperations(
+        operations,
+        createRealWorkspace(pi),
+        ctx.cwd,
+        signal,
+        { collectDiff: true },
+      );
+      const summary = applied
+        .map((result, index) => `${index + 1}. ${result.message}`)
+        .join("\n");
+      const combinedDiff = applied
+        .filter((result) => result.diff)
+        .map((result) => `File: ${result.path}\n${result.diff}`)
+        .join("\n\n");
+      const firstChangedLine = applied.find(
+        (result) => result.firstChangedLine !== undefined,
+      )?.firstChangedLine;
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Applied patch with ${applied.length} operation(s).\n${summary}`,
+          },
+        ],
+        details: { diff: combinedDiff, firstChangedLine },
       };
     },
   });

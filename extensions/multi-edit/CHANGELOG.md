@@ -1,5 +1,16 @@
 # pi-mono-multi-edit
 
+## 2.0.0
+
+### Major Changes
+
+- Stop overriding Pi's native `edit` tool. Native edit now remains active for single-file replacements and same-file batching.
+- Add `multi_file_edit` for preflighted exact replacements spanning multiple files or repeated identical occurrences in one file.
+- Add `apply_patch` for preflighted Codex-style add, update, and delete operations.
+- Use simple top-level object schemas accepted by strict OpenAI-compatible providers such as Kimi K3 through OpenCode Go.
+- Update session benchmarking to distinguish native same-file edit batches from the additive cross-file tools while retaining legacy-session support.
+- Direct repeated identical same-file replacements to `multi_file_edit`, avoiding native edit's uniqueness failure and the resulting model retry.
+
 ## 1.7.4
 
 ### Patch Changes
@@ -23,7 +34,6 @@
 ### Fixed: ask-user-question
 
 - Remove unused `StringEnum` import from `@earendil-works/pi-ai`.
-
 
 ## 1.7.1
 
@@ -50,7 +60,6 @@
 ### Tests
 
 - New `intent-queue` and `model-config` suites; expanded coverage across `leader-runtime`, `team-manager`, `team-query-tool` and `formatters`.
-
 
 ## 1.7.0
 

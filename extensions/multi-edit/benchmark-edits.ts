@@ -517,6 +517,7 @@ async function runBenchmark(scenarioFile?: string): Promise<void> {
 
 interface EditCall {
 	mode: "single" | "multi" | "patch" | "unknown";
+	isExtensionTool: boolean;
 	logicalEdits: number;
 	extensions: string[];
 	failed: boolean;
@@ -552,13 +553,21 @@ function payloadSize(args: Record<string, unknown>): number {
 			if (typeof item.newText === "string") total += item.newText.length;
 		}
 	}
+	if (Array.isArray(args.edits)) {
+		for (const item of args.edits) {
+			if (typeof item.oldText === "string") total += item.oldText.length;
+			if (typeof item.newText === "string") total += item.newText.length;
+		}
+	}
 	return total;
 }
 
 function classifyCall(
+	toolName: string,
 	args: Record<string, unknown>,
-): { mode: EditCall["mode"]; logicalEdits: number; extensions: string[] } {
+): Pick<EditCall, "mode" | "logicalEdits" | "extensions" | "isExtensionTool"> {
 	const paths: string[] = [];
+	const isExtensionTool = toolName === "multi_file_edit" || toolName === "apply_patch";
 
 	// Patch mode
 	if (typeof args.patch === "string") {
@@ -569,7 +578,19 @@ function classifyCall(
 				if (stripped.startsWith(prefix)) paths.push(stripped.slice(prefix.length));
 			}
 		}
-		return { mode: "patch", logicalEdits: Math.max(paths.length, 1), extensions: paths.map(getExt) };
+		return { mode: "patch", logicalEdits: Math.max(paths.length, 1), extensions: paths.map(getExt), isExtensionTool: true };
+	}
+
+	const edits = Array.isArray(args.edits) ? (args.edits as Record<string, unknown>[]) : [];
+	if (edits.length > 0) {
+		const topPath = (args.path as string) ?? "";
+		for (const item of edits) paths.push((item.path as string) ?? topPath);
+		return {
+			mode: toolName === "multi_file_edit" ? "multi" : "single",
+			logicalEdits: edits.length,
+			extensions: paths.map(getExt),
+			isExtensionTool,
+		};
 	}
 
 	const multi = Array.isArray(args.multi) ? (args.multi as Record<string, unknown>[]) : [];
@@ -579,23 +600,23 @@ function classifyCall(
 	if (hasSingle && multi.length > 0) {
 		paths.push(args.path as string);
 		for (const item of multi) paths.push((item.path as string) ?? (args.path as string));
-		return { mode: "multi", logicalEdits: 1 + multi.length, extensions: paths.map(getExt) };
+		return { mode: "multi", logicalEdits: 1 + multi.length, extensions: paths.map(getExt), isExtensionTool: true };
 	}
 
 	// Multi only
 	if (multi.length > 0) {
 		const topPath = (args.path as string) ?? "";
 		for (const item of multi) paths.push((item.path as string) ?? topPath);
-		return { mode: "multi", logicalEdits: multi.length, extensions: paths.map(getExt) };
+		return { mode: "multi", logicalEdits: multi.length, extensions: paths.map(getExt), isExtensionTool: true };
 	}
 
 	// Single only
 	if (hasSingle) {
 		paths.push(args.path as string);
-		return { mode: "single", logicalEdits: 1, extensions: paths.map(getExt) };
+		return { mode: "single", logicalEdits: 1, extensions: paths.map(getExt), isExtensionTool };
 	}
 
-	return { mode: "unknown", logicalEdits: 1, extensions: [] };
+	return { mode: "unknown", logicalEdits: 1, extensions: [], isExtensionTool };
 }
 
 /** Parse one JSONL session file into stats. */
@@ -617,7 +638,7 @@ function analyzeSession(filepath: string, lines: string[]): SessionStats | null 
 	const project = cwd ? basename(cwd) : basename(filepath);
 
 	// Collect tool calls and results
-	const pendingCalls = new Map<string, { args: Record<string, unknown>; ts: string }>();
+	const pendingCalls = new Map<string, { toolName: string; args: Record<string, unknown>; ts: string }>();
 	const toolResults = new Map<string, { isError: boolean; ts: string }>();
 	let totalCost = 0;
 	let totalInput = 0;
@@ -637,10 +658,13 @@ function analyzeSession(filepath: string, lines: string[]): SessionStats | null 
 			totalCost += (costInfo.total as number) ?? 0;
 
 			for (const c of (msg.content ?? []) as Record<string, unknown>[]) {
-				if (c.type === "toolCall" && (c.name === "edit" || c.name === "Edit")) {
+				if (
+					c.type === "toolCall" &&
+					(c.name === "edit" || c.name === "Edit" || c.name === "multi_file_edit" || c.name === "apply_patch")
+				) {
 					pendingCalls.set(
 						(c.id as string) ?? "",
-						{ args: (c.arguments ?? {}) as Record<string, unknown>, ts },
+						{ toolName: c.name as string, args: (c.arguments ?? {}) as Record<string, unknown>, ts },
 					);
 				}
 			}
@@ -654,8 +678,8 @@ function analyzeSession(filepath: string, lines: string[]): SessionStats | null 
 
 	// Match calls to results
 	const calls: EditCall[] = [];
-	for (const [tcId, { args, ts: callTs }] of pendingCalls) {
-		const { mode, logicalEdits, extensions } = classifyCall(args);
+	for (const [tcId, { toolName, args, ts: callTs }] of pendingCalls) {
+		const { mode, logicalEdits, extensions, isExtensionTool } = classifyCall(toolName, args);
 		let failed = false;
 		let durationMs: number | null = null;
 
@@ -668,7 +692,7 @@ function analyzeSession(filepath: string, lines: string[]): SessionStats | null 
 			}
 		}
 
-		calls.push({ mode, logicalEdits, extensions, failed, durationMs, payloadBytes: payloadSize(args), timestamp: callTs });
+		calls.push({ mode, isExtensionTool, logicalEdits, extensions, failed, durationMs, payloadBytes: payloadSize(args), timestamp: callTs });
 	}
 
 	if (calls.length === 0) return null;
@@ -676,7 +700,7 @@ function analyzeSession(filepath: string, lines: string[]): SessionStats | null 
 	return {
 		path: filepath,
 		project,
-		kind: calls.some((c) => c.mode === "multi" || c.mode === "patch") ? "multi-edit" : "base",
+		kind: calls.some((c) => c.isExtensionTool) ? "multi-edit" : "base",
 		calls,
 		totalCost,
 		totalInputTokens: totalInput,
