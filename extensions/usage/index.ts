@@ -7,6 +7,8 @@
  *   • Summary  — totals, top providers, environmental footprint
  *   • Providers — per-provider / per-model breakdown
  *   • Patterns — cost-driver insights for the selected period
+ *   • Tools    — per-extension / per-tool call breakdown
+ *   • Activity — contribution-style heatmap of daily usage + streaks
  */
 
 import type {
@@ -34,7 +36,8 @@ import { estimateAiImpact, type AiEstimateResult } from "impact-equivalences";
 // ---------------------------------------------------------------------------
 
 type Period = "day" | "week" | "month" | "all";
-type View = "summary" | "providers" | "patterns" | "tools";
+type View = "summary" | "providers" | "patterns" | "tools" | "activity";
+type Metric = "tokens" | "cost";
 
 interface TokenBucket {
 	input: number;
@@ -106,12 +109,20 @@ interface SessionLifespan {
 	last: number;
 }
 
+interface DayBucket {
+	tokens: number;
+	cost: number;
+	calls: number;
+}
+
 interface UsageReport {
 	day: PeriodReport;
 	week: PeriodReport;
 	month: PeriodReport;
 	all: PeriodReport;
 	lifespans: Map<string, SessionLifespan>;
+	/** Daily totals keyed by local `YYYY-MM-DD`, across all history. */
+	days: Map<string, DayBucket>;
 }
 
 interface SessionRecord {
@@ -131,7 +142,13 @@ interface PeriodBoundaries {
 // ---------------------------------------------------------------------------
 
 const PERIOD_ORDER: readonly Period[] = ["day", "week", "month", "all"];
-const VIEW_ORDER: readonly View[] = ["summary", "providers", "patterns", "tools"];
+const VIEW_ORDER: readonly View[] = [
+	"summary",
+	"providers",
+	"patterns",
+	"tools",
+	"activity",
+];
 
 const PERIOD_LABELS: Record<Period, string> = {
 	day: "Today",
@@ -145,6 +162,7 @@ const VIEW_LABELS: Record<View, string> = {
 	providers: "Providers",
 	patterns: "Patterns",
 	tools: "Tools",
+	activity: "Activity",
 };
 
 const NAME_COL_MAX = 28;
@@ -169,6 +187,36 @@ const BUILT_IN_TOOLS = new Set([
 	"read",
 	"write",
 ]);
+
+// Activity heatmap -----------------------------------------------------------
+const HEAT_CELL = "■";
+const HEAT_CELL_GAP = " ";
+const HEAT_CELL_WIDTH = 2;
+const HEAT_ROWS = 7;
+const HEAT_MAX_WEEKS = 53;
+const HEAT_MIN_WEEKS = 8;
+const HEAT_ROW_LABEL_WIDTH = 4;
+/** Number of intensity tiers for days with activity (level 0 = empty day). */
+const HEAT_TIERS = 4;
+const HEAT_LEVELS = HEAT_TIERS + 1;
+/** Density glyphs used when a theme color can't be resolved to RGB. */
+const HEAT_DENSITY_GLYPHS = ["·", "░", "▒", "▓", "█"];
+const HEAT_ROW_LABELS = ["Mon", "", "Wed", "", "Fri", "", "Sun"];
+const MONTH_LABELS = [
+	"Jan",
+	"Feb",
+	"Mar",
+	"Apr",
+	"May",
+	"Jun",
+	"Jul",
+	"Aug",
+	"Sep",
+	"Oct",
+	"Nov",
+	"Dec",
+];
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -285,7 +333,6 @@ function extractRegisteredToolNames(source: string): string[] {
 	const names = new Set<string>();
 	const patterns = [
 		/registerTool\s*\(\s*{[\s\S]*?name:\s*["']([^"']+)["']/g,
-		/toolName:\s*["']([^"']+)["']/g,
 	];
 	for (const pattern of patterns) {
 		let match: RegExpExecArray | null;
@@ -418,9 +465,9 @@ function estimateTextTokens(text: string): number {
 }
 
 function groupForTool(name: string, registry: ToolRegistry): string {
+	if (BUILT_IN_TOOLS.has(name)) return "Built-in";
 	const registeredGroup = registry.get(name);
 	if (registeredGroup) return registeredGroup;
-	if (BUILT_IN_TOOLS.has(name)) return "Built-in";
 	return "Other";
 }
 
@@ -511,11 +558,35 @@ function computeBoundaries(now = new Date()): PeriodBoundaries {
 	};
 }
 
+function dayKey(ts: number): string {
+	const d = new Date(ts);
+	const month = String(d.getMonth() + 1).padStart(2, "0");
+	const day = String(d.getDate()).padStart(2, "0");
+	return `${d.getFullYear()}-${month}-${day}`;
+}
+
+function startOfDay(ts: number): number {
+	const d = new Date(ts);
+	d.setHours(0, 0, 0, 0);
+	return d.getTime();
+}
+
+function placeDay(report: UsageReport, turn: RawTurn): void {
+	if (turn.ts <= 0) return;
+	const key = dayKey(turn.ts);
+	const bucket = report.days.get(key) ?? { tokens: 0, cost: 0, calls: 0 };
+	bucket.tokens += turn.input + turn.output + turn.cacheWrite;
+	bucket.cost += turn.cost;
+	bucket.calls += 1;
+	report.days.set(key, bucket);
+}
+
 function placeTurn(
 	report: UsageReport,
 	turn: RawTurn,
 	boundaries: PeriodBoundaries,
 ): void {
+	placeDay(report, turn);
 	const span = report.lifespans.get(turn.sessionId);
 	if (turn.ts > 0) {
 		if (!span) {
@@ -573,6 +644,7 @@ async function buildReport(signal?: AbortSignal): Promise<UsageReport | null> {
 		month: emptyPeriod(),
 		all: emptyPeriod(),
 		lifespans: new Map(),
+		days: new Map(),
 	};
 
 	const roots = sessionRoots();
@@ -747,6 +819,280 @@ function impactFor(slice: PeriodReport): AiEstimateResult | null {
 	} catch {
 		return null;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Activity heatmap
+// ---------------------------------------------------------------------------
+
+interface Rgb {
+	r: number;
+	g: number;
+	b: number;
+}
+
+/**
+ * A monotonic intensity ramp: `levels[0]` is the empty-day swatch and each
+ * subsequent entry is strictly brighter/more saturated than the last.
+ */
+interface HeatRamp {
+	paint: (level: number, glyph: string) => string;
+	glyph: (level: number) => string;
+}
+
+/** The 6x6x6 xterm cube channel values, mirroring pi's own 256-color mapping. */
+const CUBE_VALUES = [0, 95, 135, 175, 215, 255];
+
+/** Parses either a foreground (38) or background (48) SGR color sequence. */
+function parseAnsiRgb(ansi: string): Rgb | null {
+	const truecolor = ansi.match(/\x1b\[[34]8;2;(\d+);(\d+);(\d+)m/);
+	if (truecolor) {
+		return { r: Number(truecolor[1]), g: Number(truecolor[2]), b: Number(truecolor[3]) };
+	}
+
+	const indexed = ansi.match(/\x1b\[[34]8;5;(\d+)m/);
+	if (!indexed) return null;
+	const index = Number(indexed[1]);
+
+	if (index >= 232 && index <= 255) {
+		const gray = 8 + (index - 232) * 10;
+		return { r: gray, g: gray, b: gray };
+	}
+	if (index >= 16 && index <= 231) {
+		const offset = index - 16;
+		return {
+			r: CUBE_VALUES[Math.floor(offset / 36)]!,
+			g: CUBE_VALUES[Math.floor((offset % 36) / 6)]!,
+			b: CUBE_VALUES[offset % 6]!,
+		};
+	}
+	return null;
+}
+
+function relativeLuminance({ r, g, b }: Rgb): number {
+	return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+}
+
+function mix(from: Rgb, to: Rgb, t: number): Rgb {
+	return {
+		r: Math.round(from.r + (to.r - from.r) * t),
+		g: Math.round(from.g + (to.g - from.g) * t),
+		b: Math.round(from.b + (to.b - from.b) * t),
+	};
+}
+
+function rgbToAnsi({ r, g, b }: Rgb, mode: "truecolor" | "256color"): string {
+	if (mode === "truecolor") return `\x1b[38;2;${r};${g};${b}m`;
+	const idx = (v: number) => {
+		let best = 0;
+		for (let i = 1; i < CUBE_VALUES.length; i++) {
+			if (Math.abs(v - CUBE_VALUES[i]!) < Math.abs(v - CUBE_VALUES[best]!)) best = i;
+		}
+		return best;
+	};
+	return `\x1b[38;5;${16 + 36 * idx(r) + 6 * idx(g) + idx(b)}m`;
+}
+
+/**
+ * Contrast tuning for the heatmap ramp.
+ *
+ * `LUMA_SPAN` sets how far the hot end is pushed away from the background,
+ * `COLD_MIX` how close the empty-day swatch sits to it, and `RAMP_START` where
+ * the first active tier begins. Lowering `RAMP_START` is what spreads the four
+ * active tiers apart — widening the span alone leaves them bunched near the hot
+ * end, close to the ~1.2 just-noticeable contrast ratio.
+ */
+const HEAT_MIN_LUMA_SPAN = 0.62;
+const HEAT_COLD_MIX = 0.06;
+const HEAT_RAMP_START = 0.16;
+
+/**
+ * Builds the heatmap intensity ramp.
+ *
+ * Theme roles like `muted` / `dim` / `border` are *semantic*, not ordered by
+ * brightness — a theme may legitimately map `muted` to yellow — so using them
+ * as gradient stops produces hue jumps and duplicate steps. Instead the ramp is
+ * derived from a single hue (`accent`) swept away from the actual background,
+ * which reads as "less → more" in any theme.
+ *
+ * Two things can still flatten the ramp, so both are checked and repaired:
+ *   1. An accent whose luminance sits close to the background (many light
+ *      themes), which is fixed by extending the hot end away from the bg.
+ *   2. 256-color quantization collapsing neighbouring steps onto one index,
+ *      which is fixed by falling back to density glyphs.
+ */
+function buildHeatRamp(theme: Theme): HeatRamp {
+	const densityFallback: HeatRamp = {
+		paint: (level, glyph) => theme.fg(level === 0 ? "border" : "accent", glyph),
+		glyph: (level) => HEAT_DENSITY_GLYPHS[Math.min(level, HEAT_LEVELS - 1)]!,
+	};
+
+	const accent = parseAnsiRgb(theme.getFgAnsi("accent"));
+	if (!accent) return densityFallback;
+
+	// Anchor the cold end on the real panel background so empty days recede
+	// into it instead of floating on an arbitrary dark tint.
+	const background = parseAnsiRgb(theme.getBgAnsi("selectedBg")) ??
+		parseAnsiRgb(theme.getFgAnsi("border")) ?? { r: 0, g: 0, b: 0 };
+	const bgLuma = relativeLuminance(background);
+
+	// Sweep the accent away from the background: darker bg -> brighten toward
+	// white, lighter bg -> deepen toward black.
+	const away = bgLuma > 0.5 ? { r: 0, g: 0, b: 0 } : { r: 255, g: 255, b: 255 };
+	let hot = accent;
+	if (Math.abs(relativeLuminance(accent) - bgLuma) < HEAT_MIN_LUMA_SPAN) {
+		// Accent is too close to the background to carry a gradient on its own.
+		for (let push = 0.05; push <= 0.95; push += 0.05) {
+			hot = mix(accent, away, push);
+			if (Math.abs(relativeLuminance(hot) - bgLuma) >= HEAT_MIN_LUMA_SPAN) break;
+		}
+	}
+
+	const cold = mix(background, hot, HEAT_COLD_MIX);
+	const mode = theme.getColorMode();
+	const ansi: string[] = [];
+	for (let level = 0; level < HEAT_LEVELS; level++) {
+		const t =
+			level === 0
+				? 0
+				: HEAT_RAMP_START + (1 - HEAT_RAMP_START) * ((level - 1) / (HEAT_TIERS - 1));
+		ansi.push(rgbToAnsi(mix(cold, hot, t), mode));
+	}
+
+	// 256-color mode may quantize distinct RGB steps onto the same index. If
+	// any two stops collapse, glyph density carries the gradient instead.
+	if (new Set(ansi).size !== ansi.length) return densityFallback;
+
+	return {
+		paint: (level, glyph) => `${ansi[Math.min(level, HEAT_LEVELS - 1)]}${glyph}\x1b[39m`,
+		glyph: () => HEAT_CELL,
+	};
+}
+
+interface HeatCell {
+	ts: number;
+	value: number;
+	/** Beyond today — rendered as empty padding. */
+	future: boolean;
+}
+
+interface HeatGrid {
+	/** Column-major: weeks[w][row] where row 0 = Monday. */
+	weeks: HeatCell[][];
+	max: number;
+	/** Ascending value cut-offs; index i is the lower bound of level i+1. */
+	thresholds: number[];
+}
+
+interface ActivityStats {
+	total: number;
+	peak: { key: string; value: number } | null;
+	currentStreak: number;
+	longestStreak: number;
+}
+
+function metricValue(bucket: DayBucket, metric: Metric): number {
+	return metric === "tokens" ? bucket.tokens : bucket.cost;
+}
+
+/**
+ * Builds a GitHub-style contribution grid ending on today, Monday-first,
+ * spanning `weeks` columns.
+ */
+function buildHeatGrid(
+	days: Map<string, DayBucket>,
+	weeks: number,
+	metric: Metric,
+	now = new Date(),
+): HeatGrid {
+	const today = startOfDay(now.getTime());
+	// Monday of the current week.
+	const dow = new Date(today).getDay();
+	const offsetToMonday = dow === 0 ? 6 : dow - 1;
+	const lastMonday = today - offsetToMonday * DAY_MS;
+	const firstMonday = lastMonday - (weeks - 1) * 7 * DAY_MS;
+
+	const grid: HeatCell[][] = [];
+	const active: number[] = [];
+	let max = 0;
+
+	for (let w = 0; w < weeks; w++) {
+		const column: HeatCell[] = [];
+		for (let row = 0; row < HEAT_ROWS; row++) {
+			const ts = firstMonday + (w * 7 + row) * DAY_MS;
+			const key = dayKey(ts);
+			const bucket = days.get(key);
+			const value = bucket ? metricValue(bucket, metric) : 0;
+			if (value > max) max = value;
+			if (value > 0 && ts <= today) active.push(value);
+			column.push({ ts, value, future: ts > today });
+		}
+		grid.push(column);
+	}
+
+	return { weeks: grid, max, thresholds: quantileThresholds(active) };
+}
+
+/**
+ * Splits active days into evenly-populated intensity tiers (like GitHub does),
+ * so a few outlier days can't wash out the rest of the grid.
+ */
+function quantileThresholds(values: number[]): number[] {
+	const tiers = HEAT_TIERS;
+	if (values.length === 0) return [];
+	const sorted = values.slice().sort((a, b) => a - b);
+	const cuts: number[] = [];
+	for (let i = 1; i < tiers; i++) {
+		const index = Math.floor((sorted.length * i) / tiers);
+		cuts.push(sorted[Math.min(index, sorted.length - 1)]!);
+	}
+	return cuts;
+}
+
+function heatLevel(value: number, thresholds: number[]): number {
+	if (value <= 0) return 0;
+	let level = 1;
+	for (const cut of thresholds) {
+		if (value >= cut) level++;
+	}
+	return Math.min(HEAT_LEVELS - 1, level);
+}
+
+function computeActivityStats(days: Map<string, DayBucket>, metric: Metric, now = new Date()): ActivityStats {
+	let total = 0;
+	let peak: { key: string; value: number } | null = null;
+
+	for (const [key, bucket] of days) {
+		const value = metricValue(bucket, metric);
+		total += value;
+		if (value > 0 && (!peak || value > peak.value)) peak = { key, value };
+	}
+
+	const active = new Set(
+		[...days.entries()].filter(([, b]) => metricValue(b, metric) > 0).map(([key]) => key),
+	);
+
+	const today = startOfDay(now.getTime());
+	let currentStreak = 0;
+	// A streak stays alive if you worked today or yesterday.
+	let cursor = active.has(dayKey(today)) ? today : today - DAY_MS;
+	while (active.has(dayKey(cursor))) {
+		currentStreak++;
+		cursor -= DAY_MS;
+	}
+
+	let longestStreak = 0;
+	let run = 0;
+	const sorted = [...active].sort();
+	let previous = 0;
+	for (const key of sorted) {
+		const ts = startOfDay(Date.parse(`${key}T00:00:00`));
+		run = previous > 0 && ts - previous === DAY_MS ? run + 1 : 1;
+		if (run > longestStreak) longestStreak = run;
+		previous = ts;
+	}
+
+	return { total, peak, currentStreak, longestStreak };
 }
 
 // ---------------------------------------------------------------------------
@@ -947,11 +1293,13 @@ function pickLayout(width: number): TableLayout {
 class UsagePanel {
 	private period: Period = "all";
 	private view: View = "summary";
+	private metric: Metric = "tokens";
 	private cursor = 0;
 	private expanded = new Set<string>();
 	private providerOrder: string[] = [];
 	private toolGroupOrder: string[] = [];
 	private impactCache = new Map<Period, AiEstimateResult | null>();
+	private ramp: HeatRamp | null = null;
 
 	constructor(
 		private readonly theme: Theme,
@@ -985,6 +1333,13 @@ class UsagePanel {
 		if (input === "2") return this.gotoView("providers");
 		if (input === "3") return this.gotoView("patterns");
 		if (input === "4") return this.gotoView("tools");
+		if (input === "5") return this.gotoView("activity");
+
+		if (this.view === "activity" && matchesKey(input, "m")) {
+			this.metric = this.metric === "tokens" ? "cost" : "tokens";
+			this.requestRender();
+			return;
+		}
 
 		if (this.view !== "providers" && this.view !== "tools") return;
 
@@ -1021,6 +1376,8 @@ class UsagePanel {
 				const layout = pickLayout(width);
 				return clipLines([...head, ...this.renderTools(layout)], width);
 			}
+			case "activity":
+				return clipLines([...head, ...this.renderActivity(width)], width);
 		}
 	}
 
@@ -1069,6 +1426,11 @@ class UsagePanel {
 		this.requestRender();
 	}
 
+	private getRamp(): HeatRamp {
+		if (!this.ramp) this.ramp = buildHeatRamp(this.theme);
+		return this.ramp;
+	}
+
 	private getImpact(): AiEstimateResult | null {
 		if (!this.impactCache.has(this.period)) {
 			this.impactCache.set(this.period, impactFor(this.report[this.period]));
@@ -1082,6 +1444,8 @@ class UsagePanel {
 		const th = this.theme;
 		const title = th.fg("accent", th.bold("Pi Usage"));
 		const tabs = this.renderViewTabs();
+		// Activity always spans all history, so the period selector is irrelevant.
+		if (this.view === "activity") return [title, "", tabs, ""];
 		const periods = this.renderPeriodTabs(width);
 		const dateRange = th.fg("dim", this.renderPeriodDateRange());
 		return [title, "", periods, tabs, dateRange, ""];
@@ -1405,6 +1769,128 @@ class UsagePanel {
 		return padTo(this.theme.bold("Total"), nameWidth) + columns.map((col) => padTo(col.value(total), col.width, "left")).join("");
 	}
 
+	// ----- activity view -----------------------------------------------------
+
+	private renderActivity(width: number): string[] {
+		const th = this.theme;
+		const lines: string[] = [];
+		const indent = "  ";
+
+		const weeks = this.heatWeeksFor(width);
+		if (weeks < HEAT_MIN_WEEKS) {
+			lines.push(th.fg("dim", `${indent}Terminal too narrow for the activity heatmap.`));
+			lines.push("");
+			lines.push(...this.renderHelp(width));
+			return lines;
+		}
+
+		const grid = buildHeatGrid(this.report.days, weeks, this.metric);
+		const stats = computeActivityStats(this.report.days, this.metric);
+
+		const metricLabel = this.metric === "tokens" ? "tokens" : "cost";
+		lines.push(th.bold("Activity"));
+		lines.push(
+			th.fg(
+				"dim",
+				`Daily ${metricLabel} over the last ${weeks} weeks. Press [m] to switch metric.`,
+			),
+		);
+		lines.push("");
+		lines.push(...this.renderHeatGrid(grid, indent));
+		lines.push("");
+		lines.push(...this.renderHeatLegend(indent));
+		lines.push("");
+		lines.push(...this.renderActivityStats(stats, width, indent));
+		lines.push("");
+		lines.push(...this.renderHelp(width));
+		return lines;
+	}
+
+	private heatWeeksFor(width: number): number {
+		const available = width - HEAT_ROW_LABEL_WIDTH - 2 /* indent */;
+		const fits = Math.floor(available / HEAT_CELL_WIDTH);
+		return Math.max(0, Math.min(HEAT_MAX_WEEKS, fits));
+	}
+
+	private heatCell(cell: HeatCell, thresholds: number[]): string {
+		if (cell.future) return " ".repeat(HEAT_CELL_WIDTH);
+		const level = heatLevel(cell.value, thresholds);
+		const ramp = this.getRamp();
+		return ramp.paint(level, ramp.glyph(level)) + HEAT_CELL_GAP;
+	}
+
+	private renderHeatGrid(grid: HeatGrid, indent: string): string[] {
+		const th = this.theme;
+		const lines: string[] = [th.fg("dim", indent + this.renderMonthAxis(grid).trimEnd())];
+
+		for (let row = 0; row < HEAT_ROWS; row++) {
+			const label = th.fg("dim", padTo(HEAT_ROW_LABELS[row] ?? "", HEAT_ROW_LABEL_WIDTH));
+			let line = indent + label;
+			for (const column of grid.weeks) line += this.heatCell(column[row]!, grid.thresholds);
+			lines.push(line);
+		}
+
+		return lines;
+	}
+
+	private renderMonthAxis(grid: HeatGrid): string {
+		const slots = new Array<string>(HEAT_ROW_LABEL_WIDTH + grid.weeks.length * HEAT_CELL_WIDTH).fill(" ");
+		let lastMonth = -1;
+		let nextFree = HEAT_ROW_LABEL_WIDTH;
+
+		grid.weeks.forEach((column, index) => {
+			const month = new Date(column[0]!.ts).getMonth();
+			if (month === lastMonth) return;
+			lastMonth = month;
+
+			const label = MONTH_LABELS[month]!;
+			const start = HEAT_ROW_LABEL_WIDTH + index * HEAT_CELL_WIDTH;
+			// Skip labels that would collide with the previous one or overflow.
+			if (start < nextFree || start + label.length > slots.length) return;
+			for (let i = 0; i < label.length; i++) slots[start + i] = label[i]!;
+			nextFree = start + label.length + 1;
+		});
+
+		return slots.join("");
+	}
+
+	private renderHeatLegend(indent: string): string[] {
+		const th = this.theme;
+		const ramp = this.getRamp();
+		let swatches = "";
+		for (let level = 0; level < HEAT_LEVELS; level++) {
+			swatches += ramp.paint(level, ramp.glyph(level)) + HEAT_CELL_GAP;
+		}
+		return [
+			`${indent}${" ".repeat(HEAT_ROW_LABEL_WIDTH)}${th.fg("dim", "Less ")}${swatches}${th.fg("dim", "More")}`,
+		];
+	}
+
+	private renderActivityStats(stats: ActivityStats, width: number, indent: string): string[] {
+		const th = this.theme;
+		const format = this.metric === "tokens" ? formatTokens : formatCost;
+		const metricWord = this.metric === "tokens" ? "tokens" : "spend";
+		const cells: Array<[string, string]> = [
+			[format(stats.total), `lifetime ${metricWord}`],
+			[stats.peak ? format(stats.peak.value) : "—", "peak day"],
+			[`${stats.currentStreak} ${stats.currentStreak === 1 ? "day" : "days"}`, "current streak"],
+			[`${stats.longestStreak} ${stats.longestStreak === 1 ? "day" : "days"}`, "longest streak"],
+		];
+
+		const cellWidth = Math.max(...cells.map(([v, l]) => Math.max(visibleWidth(v), visibleWidth(l)))) + 3;
+		const inline = indent.length + cells.length * cellWidth <= width;
+
+		if (!inline) {
+			return cells.map(
+				([value, label]) => `${indent}${th.bold(padTo(value, 12))}${th.fg("dim", label)}`,
+			);
+		}
+
+		const values = cells.map(([value]) => padTo(th.bold(value), cellWidth)).join("");
+		const labels = cells.map(([, label]) => padTo(th.fg("dim", label), cellWidth)).join("");
+		return [indent + values, indent + labels];
+	}
+
 	// ----- patterns view ----------------------------------------------------
 
 	private renderPatterns(width: number): string[] {
@@ -1444,17 +1930,23 @@ class UsagePanel {
 	private renderHelp(width: number): string[] {
 		const th = this.theme;
 		const variants =
-			this.view === "providers" || this.view === "tools"
+			this.view === "activity"
 				? [
-						"[Tab/←→] period · [↑↓] select · [Enter] expand · [v/1-4] view · [q] close",
-						"[Tab] period · [↑↓] · [Enter] · [v] view · [q]",
-						"[↑↓] · [Enter] · [q]",
+						"[m] tokens/cost · [v/1-5] view · [q] close",
+						"[m] metric · [v] view · [q]",
+						"[m] · [v] · [q]",
 					]
-				: [
-						"[Tab/←→] period · [v/1-4] view · [q] close",
-						"[Tab] period · [v] view · [q]",
-						"[v] view · [q]",
-					];
+				: this.view === "providers" || this.view === "tools"
+					? [
+							"[Tab/←→] period · [↑↓] select · [Enter] expand · [v/1-5] view · [q] close",
+							"[Tab] period · [↑↓] · [Enter] · [v] view · [q]",
+							"[↑↓] · [Enter] · [q]",
+						]
+					: [
+							"[Tab/←→] period · [v/1-5] view · [q] close",
+							"[Tab] period · [v] view · [q]",
+							"[v] view · [q]",
+						];
 		return [th.fg("dim", pickFitting(width, variants))];
 	}
 }

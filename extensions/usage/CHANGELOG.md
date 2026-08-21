@@ -1,5 +1,13 @@
 # pi-mono-usage
 
+## 0.2.0
+
+### Minor Changes
+
+- Add a Tools view with expandable per-extension and per-tool usage, including call counts, estimated result tokens, and session reach.
+- Add an Activity view with a GitHub-style history heatmap, token/cost metrics, and streak statistics.
+- Replace the Last Week period with This Month.
+
 ## 0.1.2
 
 ### Patch Changes
