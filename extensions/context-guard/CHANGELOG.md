@@ -1,5 +1,29 @@
 # pi-mono-context-guard
 
+## 1.8.0
+
+### Fixed
+
+- **Read dedup never fired.** The `tool_result` handler keyed the cache on
+  `event.input.cwd` — a field the read tool does not emit — so it fell back to
+  `process.cwd()`, while the `tool_call` handler looked the entry up under
+  `ctx.cwd`. Since ~77% of reads use relative paths, the two keys rarely
+  matched and the guard was effectively dead (4 dedup hits against 2,569
+  duplicate reads over a 21-day sample). Both sites now share a single
+  `cacheKey()` helper resolving against `ctx.cwd`.
+- **Dedup only matched byte-identical calls.** The cache stored a single
+  `offset`/`limit` pair and required an exact match, so the auto-injected
+  `limit: 120` from Guard 1 caused near-duplicate reads to slip through. The
+  cache now tracks merged line _ranges_ per file and blocks any read whose
+  requested range is already fully covered.
+
+### Changed
+
+- Non-text reads (images, PDFs) are no longer cached — re-reading is the only
+  way to bring them back, so a stub would be a dead end.
+- The dedup stub now names the line ranges already in context and tells the
+  model how to page outside them.
+
 ## 1.7.4
 
 ### Patch Changes
@@ -24,7 +48,6 @@
 ### Fixed: ask-user-question
 
 - Remove unused `StringEnum` import from `@earendil-works/pi-ai`.
-
 
 ## 1.7.1
 
@@ -51,7 +74,6 @@
 ### Tests
 
 - New `intent-queue` and `model-config` suites; expanded coverage across `leader-runtime`, `team-manager`, `team-query-tool` and `formatters`.
-
 
 ## 1.7.0
 
