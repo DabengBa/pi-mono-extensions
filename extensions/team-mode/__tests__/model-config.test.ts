@@ -15,9 +15,11 @@ import { describe, test } from "node:test";
 import {
 	DEFAULT_MODEL_CONFIG,
 	detectProvider,
+	invalidateModelConfigCache,
 	isModelTier,
 	loadModelConfig,
 	modelConfigPath,
+	resetCandidateRotation,
 	resolveBareModelOverride,
 	resolveModel,
 	saveModelConfig,
@@ -42,6 +44,7 @@ function withEnv<T>(patch: NodeJS.ProcessEnv, fn: () => T): T {
 }
 
 const USER_CONFIG: ModelConfig = {
+	version: 1,
 	provider: "openai-codex",
 	providers: {
 		anthropic: {
@@ -314,6 +317,206 @@ describe("resolveBareModelOverride", () => {
 		assert.ok(resolved);
 		assert.equal(resolved.provider, "openai-codex");
 		assert.equal(resolved.thinkingLevel, "xhigh");
+	});
+});
+
+describe("v2 entry arrays", () => {
+	const V2_CONFIG: ModelConfig = {
+		version: 2,
+		provider: "openai-codex",
+		providers: {
+			"openai-codex": {
+				xs: [{ model: "openai-codex/gpt-5.3-codex", effort: "medium" }],
+				md: [
+					{ model: "openai-codex/gpt-5.6-terra", effort: "medium" },
+					{ model: "openai-codex/gpt-5.5", effort: "high" },
+				],
+			},
+		},
+		tiers: DEFAULT_MODEL_CONFIG.tiers,
+		roles: { researcher: "xs", backend: "md" },
+		roleTiers: {},
+		defaultTier: "md",
+	};
+
+	test("resolves entry effort as thinkingLevel", () => {
+		resetCandidateRotation();
+		const resolved = resolveModel(V2_CONFIG, "researcher");
+		assert.ok(resolved);
+		assert.equal(resolved.provider, "openai-codex");
+		assert.equal(resolved.model, "gpt-5.3-codex");
+		assert.equal(resolved.thinkingLevel, "medium");
+		assert.equal(resolved.candidates, undefined);
+	});
+
+	test("entry effort wins over tier thinkingLevel and roleThinkingLevels", () => {
+		resetCandidateRotation();
+		const config: ModelConfig = {
+			...V2_CONFIG,
+			roleThinkingLevels: { researcher: "high" },
+		};
+		const resolved = resolveModel(config, "researcher");
+		assert.ok(resolved);
+		assert.equal(resolved.thinkingLevel, "medium");
+	});
+
+	test("round-robin rotates the primary across multi-entry tiers", () => {
+		resetCandidateRotation();
+		const first = resolveModel(V2_CONFIG, "backend");
+		const second = resolveModel(V2_CONFIG, "backend");
+		assert.ok(first);
+		assert.ok(second);
+		assert.equal(first.model, "gpt-5.6-terra");
+		assert.equal(second.model, "gpt-5.5");
+		// Both candidates are always present, primary first.
+		assert.equal(first.candidates?.length, 2);
+		assert.equal(second.candidates?.[0].model, "gpt-5.5");
+		assert.equal(second.candidates?.[1].model, "gpt-5.6-terra");
+	});
+
+	test("weight skews round-robin toward heavier entries", () => {
+		resetCandidateRotation();
+		const weighted: ModelConfig = {
+			...V2_CONFIG,
+			providers: {
+				"openai-codex": {
+					md: [
+						{ model: "openai-codex/gpt-5.6-terra", weight: 3 },
+						{ model: "openai-codex/gpt-5.5", weight: 1 },
+					],
+				},
+			},
+		};
+		const picks = [0, 1, 2, 3].map(() => resolveModel(weighted, "backend")?.model);
+		const terra = picks.filter((m) => m === "gpt-5.6-terra").length;
+		assert.equal(terra, 3); // weight 3 vs 1 → 3 of every 4 slots
+	});
+
+	test("disabled entries are skipped", () => {
+		resetCandidateRotation();
+		const config: ModelConfig = {
+			...V2_CONFIG,
+			providers: {
+				"openai-codex": {
+					xs: [
+						{ model: "openai-codex/gpt-disabled", enabled: false },
+						{ model: "openai-codex/gpt-enabled" },
+					],
+				},
+			},
+		};
+		const resolved = resolveModel(config, "researcher");
+		assert.ok(resolved);
+		assert.equal(resolved.model, "gpt-enabled");
+		assert.equal(resolved.candidates, undefined); // only one usable entry → no chain
+	});
+
+	test("v1 string tiers and v2 entry arrays mix in one catalog", () => {
+		resetCandidateRotation();
+		const config: ModelConfig = {
+			...V2_CONFIG,
+			// Strip tier-level thinking so the model :suffix path is exercised.
+			tiers: { ...DEFAULT_MODEL_CONFIG.tiers, md: { name: "Medium" } },
+			providers: {
+				"openai-codex": {
+					xs: [{ model: "openai-codex/gpt-5.3-codex", effort: "medium" }],
+					md: "openai-codex/gpt-5.5:high",
+				},
+			},
+		};
+		const resolved = resolveModel(config, "backend");
+		assert.ok(resolved);
+		assert.equal(resolved.model, "gpt-5.5");
+		assert.equal(resolved.thinkingLevel, "high");
+		assert.equal(resolved.candidates, undefined);
+	});
+
+	test("returns null when a v2 tier is fully disabled", () => {
+		resetCandidateRotation();
+		const config: ModelConfig = {
+			...V2_CONFIG,
+			providers: {
+				"openai-codex": {
+					md: [{ model: "openai-codex/gpt-5.5", enabled: false }],
+				},
+			},
+		};
+		assert.equal(resolveModel(config, "backend"), null);
+	});
+
+	test("infers v1 or v2 when version is absent", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "team-mode-cfg-"));
+		try {
+			await writeFile(
+				join(dir, "model-config.json"),
+				JSON.stringify({ provider: "openai-codex", providers: V2_CONFIG.providers }),
+				"utf8",
+			);
+			assert.equal((await loadModelConfig(dir)).version, 2);
+
+			await writeFile(
+				join(dir, "model-config.json"),
+				JSON.stringify({
+					provider: "openai-codex",
+					providers: { "openai-codex": { md: "openai-codex/gpt-5.5" } },
+				}),
+				"utf8",
+			);
+			invalidateModelConfigCache();
+			assert.equal((await loadModelConfig(dir)).version, 1);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("version field round-trips through save/load", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "team-mode-cfg-"));
+		try {
+			await saveModelConfig(V2_CONFIG, dir);
+			const loaded = await loadModelConfig(dir);
+			assert.equal(loaded.version, 2);
+			assert.deepEqual(loaded.providers["openai-codex"], V2_CONFIG.providers["openai-codex"]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("bare override matches models inside v2 entry arrays", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "team-mode-agent-dir-"));
+		const prev = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		try {
+			await writeFile(
+				join(dir, "settings.json"),
+				JSON.stringify({ defaultProvider: "openai-codex" }),
+				"utf8",
+			);
+			const resolved = resolveBareModelOverride(V2_CONFIG, "gpt-5.6-terra");
+			assert.ok(resolved);
+			assert.equal(resolved.provider, "openai-codex");
+			assert.equal(resolved.model, "gpt-5.6-terra");
+			assert.match(resolved.rationale, /model-config catalog/);
+		} finally {
+			if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = prev;
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("entry provider override wins over catalog provider", () => {
+		resetCandidateRotation();
+		const config: ModelConfig = {
+			...V2_CONFIG,
+			providers: {
+				"openai-codex": {
+					xs: [{ model: "openai-codex/gpt-5.3-codex", provider: "opencode-go" }],
+				},
+			},
+		};
+		const resolved = resolveModel(config, "researcher");
+		assert.ok(resolved);
+		assert.equal(resolved.provider, "opencode-go");
+		assert.equal(resolved.model, "gpt-5.3-codex");
 	});
 });
 

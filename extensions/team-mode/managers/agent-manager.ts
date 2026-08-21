@@ -28,6 +28,7 @@ import {
 	resolveModel,
 	splitThinkingSuffix,
 	type ModelTier,
+	type ResolvedCandidate,
 	type ResolvedModel,
 } from "../core/model-config.js";
 
@@ -64,6 +65,8 @@ export type ModelPick = {
 	provider?: string;
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
+	/** Ordered model choices (v2 catalogs). [0] is the primary; the rest are spawn-failure fallbacks. */
+	candidates?: ResolvedCandidate[];
 	rationale: string;
 };
 
@@ -177,10 +180,13 @@ export class AgentManager {
 		await this.deps.store.setNameIndex(parentSessionId, nameIndex);
 
 		const initialMessage = buildInitialMessage(opts, spec?.description);
-		const run = runPi({
-			...this.buildRunOptions(record, initialMessage, spec ?? undefined),
-			onEvent: (event) => this.applyEvent(record, event),
-		});
+		const run = await this.launchWithFallback(
+			record,
+			initialMessage,
+			spec ?? undefined,
+			pick,
+			opts.thinkingLevel ?? spec?.thinkingLevel,
+		);
 
 		return this.track(
 			record,
@@ -199,23 +205,38 @@ export class AgentManager {
 			? await loadTeammateSpec(baseCwd, opts.subagentType)
 			: null;
 		const pick = await this.resolveModel(opts.model ?? spec?.modelTier, opts.subagentType);
-		const thinkingLevel = opts.thinkingLevel ?? spec?.thinkingLevel ?? pick.thinkingLevel;
+		const specThinking = opts.thinkingLevel ?? spec?.thinkingLevel;
 		const teammateId = generateTeammateId();
 		const name = teammateId;
 		const initialMessage = buildInitialMessage(opts, spec?.description);
 		const runner = this.deps.runTransientSession ?? runTransientSession;
-		return runner({
-			id: teammateId,
-			name,
-			description: opts.description,
-			message: initialMessage,
-			cwd: baseCwd,
-			provider: pick.provider,
-			model: pick.model,
-			thinkingLevel,
-			modelRationale: pick.rationale,
-			spec: spec ?? undefined,
-		});
+		const candidates: ResolvedCandidate[] =
+			pick.candidates && pick.candidates.length > 0
+				? pick.candidates
+				: [{ provider: pick.provider ?? "", model: pick.model ?? "" }];
+
+		let result: TeammateRunResult | undefined;
+		for (let index = 0; index < candidates.length; index++) {
+			const candidate = candidates[index];
+			result = await runner({
+				id: teammateId,
+				name,
+				description: opts.description,
+				message: initialMessage,
+				cwd: baseCwd,
+				provider: candidate.provider || undefined,
+				model: candidate.model || undefined,
+				thinkingLevel: specThinking ?? candidate.thinkingLevel ?? pick.thinkingLevel,
+				modelRationale: pick.rationale,
+				spec: spec ?? undefined,
+			});
+			// Retry the next candidate only when the run failed before producing
+			// any output — a completed (even failed-task) run is never retried.
+			const startupFailure =
+				result.status === "failed" && (result.startupFailure === true || !result.result?.trim());
+			if (!startupFailure || index === candidates.length - 1) return result;
+		}
+		return result!;
 	}
 
 	/** Resume an existing teammate by name. Context is preserved via pi's --session. */
@@ -357,6 +378,66 @@ export class AgentManager {
 		if (resolved) return packResolved(resolved);
 
 		return { rationale: "no model-config catalog entry — letting pi use its own defaults" };
+	}
+
+	/**
+	 * Start a pi run for `record`, walking the candidate fallback chain when a
+	 * candidate fails at startup (dies before producing any output — e.g. an
+	 * unknown model or auth error). Candidates arrive pre-rotated by
+	 * model-config's weighted round-robin, so entry [0] is the load-balanced
+	 * primary and the rest are fallbacks.
+	 */
+	private async launchWithFallback(
+		record: TeammateRecord,
+		message: string,
+		spec: TeammateSpec | undefined,
+		pick: ModelPick,
+		explicitThinkingLevel?: ThinkingLevel,
+	): Promise<PiRun> {
+		const candidates = pick.candidates ?? [];
+		if (candidates.length <= 1) {
+			return runPi({
+				...this.buildRunOptions(record, message, spec),
+				onEvent: (event) => this.applyEvent(record, event),
+			});
+		}
+
+		for (let index = 0; index < candidates.length; index++) {
+			const candidate = candidates[index];
+			if (index > 0) {
+				// Persist the fallback model onto the teammate record so resumes
+				// (send_message) reuse the model that actually worked.
+				record.provider = candidate.provider || record.provider;
+				record.model = candidate.model || record.model;
+				record.thinkingLevel = explicitThinkingLevel ?? candidate.thinkingLevel;
+				record.updatedAt = new Date().toISOString();
+				await this.deps.store.saveTeammate(record);
+			}
+
+			let markActive: () => void = () => {};
+			const active = new Promise<void>((resolve) => {
+				markActive = resolve;
+			});
+			const run = runPi({
+				...this.buildRunOptions(record, message, spec),
+				onEvent: (event) => {
+					if (isActivityEvent(event)) markActive();
+					this.applyEvent(record, event);
+				},
+			});
+
+			const outcome = await Promise.race([
+				active.then(() => "active" as const),
+				run.promise.then(
+					(result) => (isStartupFailure(result) ? ("failed" as const) : ("active" as const)),
+					() => "failed" as const,
+				),
+			]);
+			if (outcome === "active" || index === candidates.length - 1) return run;
+			// Startup failed before any output — abandon this run, try next candidate.
+		}
+
+		throw new Error("candidate loop exhausted");
 	}
 
 	private async resolveTeammate(nameOrId: string): Promise<TeammateRecord> {
@@ -643,11 +724,42 @@ function validateTransientOptions(opts: SpawnOpts): void {
 	}
 }
 
+/**
+ * A stream event proving the model started and is doing useful work.
+ * An assistant_message carrying only an errorMessage (e.g. unknown model,
+ * provider auth failure) is deliberately NOT activity — it's a startup failure.
+ */
+export function isActivityEvent(event: PiStreamEvent): boolean {
+	switch (event.type) {
+		case "assistant_delta":
+			return true;
+		case "tool_start":
+			return true;
+		case "assistant_message":
+			return !event.errorMessage && Boolean(event.text.trim());
+		default:
+			return false;
+	}
+}
+
+/**
+ * A run that ended before producing output looks like a startup failure
+ * (unknown model, bad provider, spawn error) and is safe to retry on the
+ * next candidate. Aborted runs and real output are never startup failures.
+ */
+export function isStartupFailure(result: PiRunResult): boolean {
+	if (result.exitSignal) return false;
+	if (result.errorMessage) return true;
+	if (result.finalMessage.trim()) return false;
+	return result.exitCode !== 0;
+}
+
 function packResolved(r: ResolvedModel): ModelPick {
 	return {
 		provider: r.provider,
 		model: r.model,
 		thinkingLevel: r.thinkingLevel,
+		candidates: r.candidates,
 		rationale: `model-config: ${r.rationale}`,
 	};
 }

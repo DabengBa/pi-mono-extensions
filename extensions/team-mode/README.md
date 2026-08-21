@@ -127,32 +127,36 @@ An `@@model` mention selects a worker model; it does not classify the task. The 
 
 Valid thinking levels are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh`. Team-mode passes the selected level to the teammate subprocess as `pi --thinking <level>`. Token budgets remain pi's responsibility via `~/.pi/agent/settings.json` `thinkingBudgets`.
 
-`model-config.json` can define compact role/tier defaults:
+`model-config.json` defines provider catalogs plus role/tier defaults. Schema v2 accepts an ordered array of model entries per tier:
 
 ```jsonc
 {
+  "version": 2,
+  "provider": "auto",
   "defaultTier": "md",
+  "providers": {
+    "openai-codex": {
+      "xs": [{ "model": "openai-codex/gpt-5.3-codex", "effort": "medium" }],
+      "md": [
+        {
+          "model": "openai-codex/gpt-5.6-terra",
+          "effort": "medium",
+          "weight": 3
+        },
+        { "model": "openai-codex/gpt-5.5", "effort": "high", "weight": 1 }
+      ]
+    },
+    // v1 strings remain valid and can be mixed with v2 arrays.
+    "anthropic": {
+      "md": "anthropic/claude-sonnet-4-6"
+    }
+  },
   "tiers": {
-    "sm": {
-      "name": "Small",
-      "thinkingLevel": "low",
-      "description": "Simple tasks, deterministic outputs. Use for formatting, rewriting, classification",
-    },
-    "md": {
-      "name": "Medium",
-      "thinkingLevel": "medium",
-      "description": "Handles moderate complexity. Use for workflows, APIs, structured tasks",
-    },
-    "lg": {
-      "name": "Large",
-      "thinkingLevel": "high",
-      "description": "Strong reasoning, multi-step tasks. Use for reasoning, planning, debugging, decision support",
-    },
-    "xl": {
-      "name": "Deep",
-      "thinkingLevel": "xhigh",
-      "description": "Near-frontier capability, complex domains. Complex planning, abstraction, ambiguous problems",
-    },
+    "xs": { "name": "Extra Small", "thinkingLevel": "minimal" },
+    "sm": { "name": "Small", "thinkingLevel": "low" },
+    "md": { "name": "Medium", "thinkingLevel": "medium" },
+    "lg": { "name": "Large", "thinkingLevel": "high" },
+    "xl": { "name": "Deep", "thinkingLevel": "xhigh" }
   },
   "roles": {
     "researcher": "sm",
@@ -161,14 +165,24 @@ Valid thinking levels are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh`
     "frontend": "md",
     "tester": "md",
     "planner": "lg",
-    "reviewer": "md",
-  },
+    "reviewer": "md"
+  }
 }
 ```
 
-Built-in provider catalogs map `xs`/`sm` to small models, `md` to default models, and `lg`/`xl` to large models. You can still override `providers` if you want exact model IDs per tier. Legacy `roleTiers`, `tierThinkingLevels`, and `roleThinkingLevels` remain supported.
+Each v2 entry supports:
 
-Thinking resolution order is: explicit tool `thinking`, teammate spec `thinkingLevel`, `roles`/`roleTiers` tier metadata (`tiers[tier].thinkingLevel`), a legacy `:<thinking>` model suffix such as `gpt-5.4:high`, legacy `tierThinkingLevels`, then `defaultThinkingLevel`. If none applies, pi inherits its normal default.
+- `model` (required): fully-qualified `provider/model` ID.
+- `effort` or `thinkingLevel`: aliases using `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
+- `provider`: optional provider override; otherwise the model prefix is used.
+- `weight`: positive round-robin weight; defaults to `1`.
+- `enabled`: set to `false` to retain an entry without selecting it.
+
+Multiple enabled entries form both a process-lifetime weighted round-robin pool and an ordered fallback chain. Each spawn rotates the primary according to weight. If that model fails before producing assistant output or starting a tool, team-mode tries the remaining entries in rotated order. A working fallback is persisted for durable teammates so `send_message` resumes with it. Aborted or active runs are not retried.
+
+The `version` field is explicit in v2 configs; when omitted, team-mode infers v1 or v2 from the catalog shape. Built-in catalogs and v1 string tiers remain supported, and v1 strings can be mixed with v2 arrays in the same catalog. Legacy `roleTiers`, `tierThinkingLevels`, and `roleThinkingLevels` also remain supported.
+
+Thinking resolution order is: explicit tool `thinking`, teammate spec `thinkingLevel`, v2 entry `effort`/`thinkingLevel`, legacy `roleThinkingLevels`, tier metadata (`tiers[tier].thinkingLevel`), a legacy `:<thinking>` model suffix such as `gpt-5.4:high`, legacy `tierThinkingLevels`, then `defaultThinkingLevel`. If none applies, pi inherits its normal default.
 
 ## Execution runtimes
 

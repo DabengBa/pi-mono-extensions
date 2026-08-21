@@ -1,5 +1,12 @@
 # pi-mono-team-mode
 
+## 2.5.0
+
+### Minor Changes
+
+- Add model-config schema v2 with per-tier model entry arrays, weighted round-robin selection, and ordered startup-failure fallback while preserving v1 string catalogs.
+- Support per-entry thinking effort, provider overrides, weights, and enabled flags, with explicit or inferred schema versions.
+
 ## 2.4.1
 
 ### Patch Changes

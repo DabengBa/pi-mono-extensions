@@ -126,6 +126,7 @@ export async function runTransientSession(opts: TransientSessionOpts): Promise<T
 			description: opts.description,
 			status: "failed",
 			result: `[transient error] ${err instanceof Error ? err.message : String(err)}`,
+			startupFailure: !finalMessage && deltaBuffer.length === 0 && metrics.toolUses === 0,
 			exitCode: null,
 			metrics,
 			provider: opts.provider,

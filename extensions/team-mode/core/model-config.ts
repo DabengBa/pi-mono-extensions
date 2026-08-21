@@ -11,6 +11,7 @@
  * Schema (all fields optional; defaults are merged in):
  *
  *   {
+ *     "version": 2,
  *     "defaultTier": "md",
  *     "tiers": {
  *       "sm": { "name": "Small",  "thinkingLevel": "low",    "description": "Simple tasks" },
@@ -29,10 +30,26 @@
  *     },
  *     "provider": "openai-codex" | "anthropic" | "auto",
  *     "providers": {
- *       "openai-codex": { "sm": "openai-codex/gpt-5.4-mini", "md": "openai-codex/gpt-5.4" },
- *       "anthropic":   { "sm": "anthropic/claude-haiku-4-5",  "md": "anthropic/claude-sonnet-4-6" }
+ *       // v1: tier → fully-qualified model string (still supported)
+ *       "anthropic": { "sm": "anthropic/claude-haiku-4-5", "md": "anthropic/claude-sonnet-4-6" },
+ *       // v2: tier → array of entries. Multiple entries act as a weighted
+ *       // round-robin pool for load distribution AND an ordered fallback
+ *       // chain when a model fails to start.
+ *       "openai-codex": {
+ *         "xs": [{ "model": "openai-codex/gpt-5.3-codex", "effort": "medium" }],
+ *         "md": [
+ *           { "model": "openai-codex/gpt-5.6-terra", "effort": "medium", "weight": 3 },
+ *           { "model": "openai-codex/gpt-5.5",        "effort": "medium", "weight": 1 }
+ *         ]
+ *       }
  *     }
  *   }
+ *
+ * Entry fields (v2): `model` (required, fully-qualified `provider/id`),
+ * `effort` (alias of thinkingLevel: off/minimal/low/medium/high/xhigh),
+ * `thinkingLevel` (explicit spelling), `provider` (override; defaults to the
+ * model prefix), `weight` (round-robin weight, default 1), `enabled` (set
+ * false to keep an entry configured but skip it).
  *
  * Resolution order inside `resolveModel`:
  *   1. tierOverride (from caller's `model` param if it matches a configured tier)
@@ -41,12 +58,13 @@
  *
  * Thinking-level resolution:
  *   1. caller/spec explicit override (applied by AgentManager)
- *   2. legacy roleThinkingLevels[role]
- *   3. tiers[selectedTier].thinkingLevel
- *   4. `:<thinking>` suffix in the selected catalog model (back compat)
- *   5. legacy tierThinkingLevels[selectedTier]
- *   6. defaultThinkingLevel
- *   6. unset — let pi inherit its own defaultThinkingLevel
+ *   2. v2 entry `effort`/`thinkingLevel` on the selected model
+ *   3. legacy roleThinkingLevels[role]
+ *   4. tiers[selectedTier].thinkingLevel
+ *   5. `:<thinking>` suffix in the selected catalog model (back compat)
+ *   6. legacy tierThinkingLevels[selectedTier]
+ *   7. defaultThinkingLevel
+ *   8. unset — let pi inherit its own defaultThinkingLevel
  *
  * Provider resolution:
  *   1. config.provider when not "auto"
@@ -65,7 +83,39 @@ import type { ThinkingLevel } from "./types.js";
 
 export type ModelTier = string;
 
-export type ProviderCatalog = Record<string, string>;
+/**
+ * v2 per-tier catalog entry. `effort` and `thinkingLevel` are aliases
+ * (same off/minimal/low/medium/high/xhigh scale). Multiple entries per tier form
+ * a weighted round-robin pool (load distribution) and an ordered fallback
+ * chain for spawn failures.
+ */
+export type TierModelEntry = {
+	/** Fully-qualified model id, e.g. "openai-codex/gpt-5.4" (may carry a `:thinking` suffix). */
+	model: string;
+	/** Thinking level for this model — alias of thinkingLevel. */
+	effort?: ThinkingLevel;
+	/** Thinking level for this model (explicit spelling). */
+	thinkingLevel?: ThinkingLevel;
+	/** Provider override; defaults to the `model` prefix. */
+	provider?: string;
+	/** Round-robin weight (default 1). Larger = selected more often. */
+	weight?: number;
+	/** Set false to keep the entry configured but exclude it from selection. */
+	enabled?: boolean;
+};
+
+/** v1: tier → fqn string. v2: tier → ordered entry list. Mixed per tier is fine. */
+export type ProviderCatalog = Record<string, string | TierModelEntry[]>;
+
+/** A concrete model choice produced from a tier entry. */
+export type ResolvedCandidate = {
+	/** Pi `--provider` value. */
+	provider: string;
+	/** Bare model id (no `provider/` prefix). Pi `--model` value. */
+	model: string;
+	/** Thinking level for this candidate (entry effort, else tier/role fallbacks). */
+	thinkingLevel?: ThinkingLevel;
+};
 
 export type TierConfig = {
 	name?: string;
@@ -74,6 +124,8 @@ export type TierConfig = {
 };
 
 export type ModelConfig = {
+	/** Config schema version. 1 = legacy strings, 2 = entry arrays. Optional; inferred from shape when absent. */
+	version?: number;
 	/** Provider to use for all teammates. Use "auto" to detect from settings. */
 	provider: string;
 	/** Per-provider tier → fully-qualified model id. */
@@ -105,6 +157,8 @@ export type ResolvedModel = {
 	tier: ModelTier;
 	/** Thinking level selected from role/tier/default config or model suffix. */
 	thinkingLevel?: ThinkingLevel;
+	/** Ordered model choices for the tier (v2). [0] is the primary pick; the rest are fallbacks. */
+	candidates?: ResolvedCandidate[];
 	/** One-line explanation of the resolution path. */
 	rationale: string;
 };
@@ -116,6 +170,7 @@ type PiSettings = {
 };
 
 export const DEFAULT_MODEL_CONFIG: ModelConfig = {
+	version: 1,
 	provider: "auto",
 	providers: {
 		anthropic: {
@@ -265,6 +320,9 @@ export async function saveModelConfig(
  * Resolve the concrete `{ provider, model }` for a role + optional tier.
  * Returns `null` if the resolved provider has no catalog entry.
  *
+ * v2 tiers with multiple entries return `candidates` ordered by the
+ * weighted round-robin rotation (primary first, rest as fallback chain).
+ *
  * @param config          The loaded model config.
  * @param role            The teammate's role (subagent_type). Empty string = use defaultTier.
  * @param tierOverride    Optional tier to force, regardless of role mapping.
@@ -279,24 +337,23 @@ export function resolveModel(
 	if (!catalog) return null;
 
 	const tier = tierOverride ?? config.roles[role] ?? config.roleTiers[role] ?? config.defaultTier;
-	const fqn = catalog[tier];
-	if (!fqn) return null;
+	const entries = normalizeTierEntries(catalog[tier]).filter((e) => e.enabled !== false);
+	if (entries.length === 0) return null;
 
-	const { provider: splitProvider, id } = splitFqn(fqn);
-	const { model, thinkingLevel: suffixThinkingLevel } = splitThinkingSuffix(id);
-	const thinkingLevel =
-		config.roleThinkingLevels?.[role] ??
-		config.tiers[tier]?.thinkingLevel ??
-		suffixThinkingLevel ??
-		config.tierThinkingLevels?.[tier] ??
-		config.defaultThinkingLevel;
-	const rationale = buildRationale(role, tier, tierOverride, provider, config);
+	const ordered = orderCandidates(`${provider}:${tier}`, entries);
+	const candidates = ordered.map((entry) => toCandidate(entry, config, role, tier));
+	const primary = candidates[0];
+
+	const rationale =
+		buildRationale(role, tier, tierOverride, provider, config) +
+		(candidates.length > 1 ? ` (candidate 1/${candidates.length} via round-robin)` : "");
 
 	return {
-		provider: splitProvider ?? provider,
-		model,
+		provider: primary.provider,
+		model: primary.model,
 		tier,
-		thinkingLevel,
+		thinkingLevel: primary.thinkingLevel,
+		candidates: candidates.length > 1 ? candidates : undefined,
 		rationale,
 	};
 }
@@ -328,12 +385,12 @@ export function resolveBareModelOverride(
 	}> = [];
 
 	for (const [providerKey, catalog] of Object.entries(config.providers)) {
-		for (const fqn of Object.values(catalog)) {
-			const split = splitFqn(fqn);
+		for (const { entry } of catalogEntries(catalog)) {
+			const split = splitFqn(entry.model);
 			const candidate = splitThinkingSuffix(split.id);
 			if (candidate.model !== requested.model) continue;
 			candidates.push({
-				provider: split.provider ?? providerKey,
+				provider: entry.provider ?? split.provider ?? providerKey,
 				model: candidate.model,
 				thinkingLevel: candidate.thinkingLevel,
 				source: "model-config catalog",
@@ -439,6 +496,86 @@ export function detectProvider(explicit?: string): string {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Flatten a provider catalog into `{ tier, entry }` pairs, accepting both
+ * v1 string tiers and v2 entry arrays.
+ */
+export function catalogEntries(
+	catalog: ProviderCatalog,
+): Array<{ tier: string; entry: TierModelEntry }> {
+	const out: Array<{ tier: string; entry: TierModelEntry }> = [];
+	for (const [tier, value] of Object.entries(catalog)) {
+		for (const entry of normalizeTierEntries(value)) out.push({ tier, entry });
+	}
+	return out;
+}
+
+/** Normalize a tier catalog value (v1 string or v2 entry array) into entries. */
+function normalizeTierEntries(value: string | TierModelEntry[] | undefined): TierModelEntry[] {
+	if (!value) return [];
+	if (typeof value === "string") return [{ model: value }];
+	return value.filter((entry) => typeof entry?.model === "string" && entry.model.length > 0);
+}
+
+// Weighted round-robin rotation state, keyed by "provider:tier".
+// Module-level like the config cache; process lifetime is the rotation window.
+const candidateRotation = new Map<string, number>();
+
+/** Test seam: reset round-robin rotation state. */
+export function resetCandidateRotation(): void {
+	candidateRotation.clear();
+}
+
+/**
+ * Order entries for one selection: expand entries into weight slots, advance
+ * the rotation cursor, and return distinct entries starting at the cursor.
+ */
+function orderCandidates(key: string, entries: TierModelEntry[]): TierModelEntry[] {
+	const slots: TierModelEntry[] = [];
+	for (const entry of entries) {
+		const weight = Math.max(1, Math.floor(entry.weight ?? 1));
+		for (let i = 0; i < weight; i++) slots.push(entry);
+	}
+	if (slots.length === 0) return [];
+
+	const cursor = candidateRotation.get(key) ?? 0;
+	candidateRotation.set(key, (cursor + 1) % slots.length);
+
+	const ordered: TierModelEntry[] = [];
+	const seen = new Set<TierModelEntry>();
+	for (let i = 0; i < slots.length; i++) {
+		const entry = slots[(cursor + i) % slots.length];
+		if (seen.has(entry)) continue;
+		seen.add(entry);
+		ordered.push(entry);
+	}
+	return ordered;
+}
+
+/** Convert one tier entry into a concrete candidate with resolved thinking level. */
+function toCandidate(
+	entry: TierModelEntry,
+	config: ModelConfig,
+	role: string,
+	tier: ModelTier,
+): ResolvedCandidate {
+	const { provider: splitProvider, id } = splitFqn(entry.model);
+	const { model, thinkingLevel: suffixThinkingLevel } = splitThinkingSuffix(id);
+	const thinkingLevel =
+		entry.effort ??
+		entry.thinkingLevel ??
+		config.roleThinkingLevels?.[role] ??
+		config.tiers[tier]?.thinkingLevel ??
+		suffixThinkingLevel ??
+		config.tierThinkingLevels?.[tier] ??
+		config.defaultThinkingLevel;
+	return {
+		provider: entry.provider ?? splitProvider ?? "",
+		model,
+		thinkingLevel,
+	};
+}
+
 function mergeWithDefaults(partial: Partial<ModelConfig>): ModelConfig {
 	const mergedTiers = mergeTiers(partial.tiers, partial.tierThinkingLevels);
 	const mergedRoles = {
@@ -472,6 +609,18 @@ function mergeWithDefaults(partial: Partial<ModelConfig>): ModelConfig {
 	if (partial.taskCompletedHook !== undefined) {
 		base.taskCompletedHook = partial.taskCompletedHook;
 	}
+	base.version = partial.version ?? inferModelConfigVersion(partial.providers);
+	return base;
+}
+
+function inferModelConfigVersion(providers: Partial<ModelConfig>["providers"]): number {
+	if (!providers) return 1;
+	return Object.values(providers).some((catalog) =>
+		Object.values(catalog).some(Array.isArray),
+	)
+		? 2
+		: 1;
+}
 
 function mergeTiers(
 	tiers: Partial<ModelConfig>["tiers"],
@@ -485,8 +634,6 @@ function mergeTiers(
 		merged[tier] = { ...(merged[tier] ?? {}), thinkingLevel };
 	}
 	return merged;
-}
-	return base;
 }
 
 function providerFromModelHint(modelHint: string): string | null {

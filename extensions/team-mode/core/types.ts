@@ -140,6 +140,8 @@ export type TeammateRunResult = {
 	background?: boolean;
 	durationMs?: number;
 	runtime?: ExecutionRuntime;
+	/** True when the selected model failed before producing text or starting a tool. */
+	startupFailure?: boolean;
 };
 
 /** Teammate role spec loaded from `.pi/teammates/*.md` or `.claude/teammates/*.md`. */
