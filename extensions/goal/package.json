@@ -6,6 +6,9 @@
     "pi-package",
     "pi-extension"
   ],
+  "scripts": {
+    "test": "npx tsx --test '__tests__/**/*.test.ts'"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
