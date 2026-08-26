@@ -439,7 +439,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				updated = appendGoalEvent(pi, ctx, statusEvent(state.goalId, params.status, params.summary ?? params.progressNote)) ?? updated;
 				if (params.status !== "active") continuationQueuedForGoalId = undefined;
 			}
-			return { ...getGoalResult(updated), terminate: params.status === "completed" || params.status === "cancelled" || params.status === "blocked" };
+			// Teammates must complete one more model turn to return their result to the coordinator.
+			const terminate = process.env.PI_TEAM_MATE_SUBPROCESS !== "1" && Boolean(params.status && isTerminalStatus(params.status));
+			return { ...getGoalResult(updated), terminate };
 		},
 	});
 
