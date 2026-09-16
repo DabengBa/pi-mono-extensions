@@ -3,4 +3,5 @@ node_modules
 .vscode
 specs/*
 DS_Store
-.pi
+.pi.worktrees/
+.worktrees/
