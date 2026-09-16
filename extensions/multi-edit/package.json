@@ -1,0 +1,37 @@
+{
+  "name": "pi-mono-multi-edit",
+  "version": "2.0.0",
+  "description": "Additive Pi tools for cross-file, repeated-occurrence, and Codex-style patch edits",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "scripts": {
+    "test": "npx tsx --test '__tests__/**/*.test.ts'",
+    "bench": "npx tsx benchmark-edits.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "dependencies": {
+    "diff": "^8.0.4"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emanuelcasco/pi-mono-extensions.git",
+    "directory": "extensions/multi-edit"
+  },
+  "bugs": {
+    "url": "https://github.com/emanuelcasco/pi-mono-extensions/issues"
+  },
+  "homepage": "https://github.com/emanuelcasco/pi-mono-extensions#readme"
+}
