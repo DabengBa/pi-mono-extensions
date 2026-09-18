@@ -86,16 +86,33 @@ Supported operations:
 | Header                    | Effect                                             |
 | ------------------------- | -------------------------------------------------- |
 | `*** Add File: <path>`    | Create or overwrite a file from `+`-prefixed lines |
-| `*** Update File: <path>` | Apply one or more `@@`-delimited hunks             |
+| `*** Update File: <path>` | Apply one or more `@@`-delimited hunks; optionally move to a new path |
 | `*** Delete File: <path>` | Delete an existing file                            |
 
-Patch operations are preflighted against a virtual filesystem before mutation. Update hunks support exact matching followed by per-line trailing-whitespace tolerance.
+Patch operations are preflighted against a virtual filesystem before mutation. Update hunks support exact matching followed by per-line trailing-whitespace tolerance. A `*** Move to: <path>` line may appear immediately after an `*** Update File:` header to write the updated content to a new path and remove the source. `*** End of File` after a hunk requires that hunk to match through the file end, including pure appends.
 
-### Unsupported patch features
+### Move and EOF limitations
 
-- `*** Move to:` renames — use add plus delete
-- `*** End of File` sentinel hunks
-- Full whitespace or Unicode-normalized patch matching
+- `*** Move to: <path>` is valid only immediately after its `*** Update File:` header and before the first hunk.
+- A move writes the destination before deleting the source. Validation failures are preflighted without mutation, but an unexpected source-delete I/O failure after a successful destination write is not compensated.
+- `*** End of File` is a hunk terminator, not a standalone file operation; its hunk must match the end of the current file.
+- Full whitespace or Unicode-normalized patch matching is not supported.
+
+### Grammar constrained sampling and fallback
+
+`apply_patch` declares a Lark grammar (`APPLY_PATCH_GRAMMAR` in `patch.ts`) for providers that support OpenAI grammar-constrained custom tools:
+
+```ts
+constrainedSampling: {
+  type: "grammar",
+  variants: { openai_lark: APPLY_PATCH_GRAMMAR },
+}
+```
+
+- When the model supports grammar tools, pi-ai advertises `apply_patch` as an OpenAI `custom` tool whose `format` is `{ type: "grammar", syntax: "lark", definition }`. The patch payload is then generated against the grammar.
+- When the model does not support grammar tools, pi-ai ignores the declaration and advertises the ordinary `function` tool built from `parameters`, so the JSON schema and the parser remain the only contract. The fallback is resolved per request from provider capability, not from a model-id list, so unsupported models keep working with the same `patch` payload.
+- The grammar mirrors the parser exactly: `*** Begin Patch` / `*** End Patch` envelope, `*** Add File:`, `*** Delete File:`, `*** Update File:`, `*** Move to:`, `@@` and `@@ <context>` hunk headers, `+`/`-`/space hunk lines, blank-line separators, and the `*** End of File` hunk terminator, with CRLF tolerance.
+- `patch` must stay the only required property, because grammar constrained sampling derives the constrained input property from the single required string field.
 
 ## Choosing a tool
 

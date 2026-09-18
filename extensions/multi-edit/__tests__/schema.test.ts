@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { Value } from "@sinclair/typebox/value";
+import { Value } from "typebox/value";
 
 import registerMultiEdit, {
   applyPatchSchema,
@@ -70,6 +70,18 @@ describe("multi-file edit schemas", () => {
       }),
       false,
     );
+  });
+
+  test("supports grammar constrained sampling with a single required patch string", () => {
+    const schema = applyPatchSchema as unknown as {
+      type?: string;
+      required?: string[];
+      properties?: Record<string, { type?: string }>;
+    };
+    assert.equal(schema.type, "object");
+    assert.deepEqual(schema.required, ["patch"]);
+    assert.deepEqual(Object.keys(schema.properties ?? {}), ["patch"]);
+    assert.equal(schema.properties?.patch?.type, "string");
   });
 
   test("uses provider-compatible top-level object schemas", () => {

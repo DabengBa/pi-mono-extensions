@@ -12,12 +12,12 @@
  *
  * Compatibility notes (vs the original Codex apply_patch format):
  * - Hunks MUST start with a "@@" header. Missing headers are rejected.
- * - Only exact-match hunk anchoring — no 4-pass fuzzy `seekSequence`.
- * - `*** End of File` sentinel hunks are not recognized.
- * - `*** Move to:` is rejected.
+ * - Exact-match hunk anchoring with a trailing-whitespace fallback — no 4-pass
+ *   fuzzy `seekSequence`.
+ * - Supports `*** End of File` hunk terminators and `*** Move to:` updates.
  */
 
-import { isAbsolute, resolve as resolvePath } from "path";
+import { isAbsolute, resolve as resolvePath, dirname } from "path";
 
 import { generateDiffString } from "./diff.ts";
 import type {
@@ -68,10 +68,74 @@ const DIRECTIVE_ADD = "*** Add File: ";
 const DIRECTIVE_DELETE = "*** Delete File: ";
 const DIRECTIVE_UPDATE = "*** Update File: ";
 const DIRECTIVE_MOVE = "*** Move to: ";
+const DIRECTIVE_EOF = "*** End of File";
 
 const isBlank = (line: string): boolean => line.trim() === "";
 const isDirective = (line: string): boolean =>
   line.trimEnd().startsWith("*** ");
+
+// ---------------------------------------------------------------------------
+// Constrained-sampling grammar
+// ---------------------------------------------------------------------------
+
+/**
+ * Lark grammar describing exactly the patch language `parsePatch` accepts.
+ *
+ * This is the `openai_lark` variant handed to providers that support grammar
+ * constrained sampling for custom tools. It must stay in lockstep with the
+ * parser above: every string it accepts must parse, and every patch the parser
+ * accepts must be in the language. `__tests__/grammar.test.ts` pins the parser
+ * surface, and the differential Lark cross-check under
+ * `scripts/grammar-crosscheck/` proves acceptance parity against the parser.
+ *
+ * Deliberate normalisations mirrored from the parser:
+ * - `LF` is CRLF-tolerant because `parsePatch` normalises `\r\n` to `\n`.
+ * - `BLANK` matches whitespace-only separator lines (`String.trim()` semantics).
+ * - `FILE_CONTENT` requires one non-whitespace character, because the parser
+ *   trims directive lines and then rejects a directive without a path.
+ * - `add_hunk` and `update_hunk` consume trailing blank lines themselves
+ *   (add bodies reject them, hunk bodies treat them as empty context lines),
+ *   while `delete_hunk` may be followed by a blank run.
+ */
+export const APPLY_PATCH_GRAMMAR = `start: WS_PREFIX? begin_patch blank_run? op_seq? end_patch
+
+begin_patch: "*** Begin Patch" LINE_WS? LF
+end_patch: LINE_WS? "*** End Patch" TRAILING?
+
+blank_run: BLANK+
+
+op_seq: add_hunk after_tight
+      | delete_hunk after_loose
+      | update_hunk after_tight
+
+after_tight: (add_hunk after_tight | delete_hunk after_loose | update_hunk after_tight)?
+after_loose: (blank_run? add_hunk after_tight
+            | blank_run? delete_hunk after_loose
+            | blank_run? update_hunk after_tight
+            | blank_run?)?
+
+add_hunk: "*** Add File: " filename LF add_line*
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? blank_run? change eof_tail?
+eof_tail: eof_line blank_run?
+
+filename: FILE_CONTENT
+add_line: "+" LINE_CONTENT? LF
+
+change_move: "*** Move to: " filename LF
+change: (change_context change_line+)+
+change_context: ("@@" | "@@ " LINE_CONTENT) LINE_WS? LF
+change_line: ("+" | "-" | " ") LINE_CONTENT? LF
+           | LF
+eof_line: "*** End of File" LINE_WS? LF
+
+LF: /\\r?\\n/
+LINE_CONTENT: /[^\\n]+/
+FILE_CONTENT: /[^\\n]*[^ \\t\\r\\n][^\\n]*/
+LINE_WS: /[ \\t]+/
+BLANK: /[ \\t]*\\r?\\n/
+WS_PREFIX: /[ \\t\\r\\n]+/
+TRAILING: /[ \\t\\r\\n]+/`;
 
 export function parsePatch(patchText: string): PatchOperation[] {
   const normalized = patchText.replace(/\r\n/g, "\n").trim();
@@ -143,13 +207,17 @@ function parseAddFile(path: string, cursor: LineCursor): PatchOperation {
 }
 
 function parseUpdateFile(path: string, cursor: LineCursor): PatchOperation {
-  // Move-to is explicitly rejected — we only support in-place updates.
+  let moveTo: string | undefined;
   const lookahead = cursor.peek();
   if (
     lookahead !== undefined &&
     lookahead.trimEnd().startsWith(DIRECTIVE_MOVE)
   ) {
-    throw new Error("Patch move operations (*** Move to:) are not supported.");
+    const moveLine = cursor.next()!.trimEnd();
+    moveTo = moveLine.slice(DIRECTIVE_MOVE.length).trim();
+    if (!moveTo) {
+      throw new Error(`Move destination for '${path}' cannot be empty`);
+    }
   }
 
   const hunks: Hunk[] = [];
@@ -159,7 +227,26 @@ function parseUpdateFile(path: string, cursor: LineCursor): PatchOperation {
     if (!cursor.hasMore()) break;
 
     const line = cursor.peek()!;
-    if (isDirective(line)) break;
+    const trimmed = line.trimEnd();
+    if (isDirective(line)) {
+      if (trimmed.startsWith(DIRECTIVE_MOVE)) {
+        throw new Error(
+          `Move to for '${path}' is only allowed immediately after the Update File header and before the first hunk`,
+        );
+      }
+      if (trimmed === DIRECTIVE_EOF) {
+        throw new Error(
+          `End of File marker for '${path}' must follow a hunk`,
+        );
+      }
+      break;
+    }
+
+    if (hunks.at(-1)?.endOfFile) {
+      throw new Error(
+        `No hunk content may follow an End of File marker for '${path}'`,
+      );
+    }
 
     hunks.push(parseHunk(path, cursor));
   }
@@ -168,7 +255,8 @@ function parseUpdateFile(path: string, cursor: LineCursor): PatchOperation {
     throw new Error(`Update file hunk for path '${path}' is empty`);
   }
 
-  return { kind: "update", path, hunks };
+  if (moveTo === undefined) return { kind: "update", path, hunks };
+  return { kind: "update", path, moveTo, hunks };
 }
 
 function parseHunk(path: string, cursor: LineCursor): Hunk {
@@ -191,13 +279,21 @@ function parseHunk(path: string, cursor: LineCursor): Hunk {
 
   const oldLines: string[] = [];
   const newLines: string[] = [];
+  let endOfFile = false;
 
   while (cursor.hasMore()) {
     const raw = cursor.peek()!;
     const trimEnd = raw.trimEnd();
 
-    // Any directive or next hunk header ends the current hunk.
-    if (trimEnd.startsWith("@@") || isDirective(raw)) break;
+    // Any directive or next hunk header ends the current hunk. EOF is the
+    // one directive owned by a hunk, so consume it here as its terminator.
+    if (trimEnd.startsWith("@@") || isDirective(raw)) {
+      if (trimEnd === DIRECTIVE_EOF) {
+        cursor.next();
+        endOfFile = true;
+      }
+      break;
+    }
 
     cursor.next();
 
@@ -229,11 +325,13 @@ function parseHunk(path: string, cursor: LineCursor): Hunk {
     throw new Error(`Update hunk for '${path}' does not contain any lines`);
   }
 
-  return {
+  const hunk: Hunk = {
     contextPrefix,
     oldBlock: oldLines.join("\n"),
     newBlock: newLines.join("\n"),
   };
+  if (endOfFile) hunk.endOfFile = true;
+  return hunk;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,121 +339,207 @@ function parseHunk(path: string, cursor: LineCursor): Hunk {
 // ---------------------------------------------------------------------------
 
 /**
- * Apply a list of hunks to a file's content. Operates directly on the raw
- * string via `indexOf` — no intermediate line-array reconstruction. A search
- * cursor advances after each hunk so repeated `oldBlock` strings are matched
- * in top-to-bottom order.
- */
-/**
  * Find `needle` in `haystack` starting from `offset`. Tries exact match
  * first; if that fails, retries with per-line trimEnd on both sides.
- * Returns `{ pos, matchLength }` referencing the *original* haystack, or
+ * Returns `{ pos, matchLength }` referencing the original haystack, or
  * undefined when no match is found in either pass.
  */
+type BlockMatch = { pos: number; matchLength: number };
+
+interface NormalizedText {
+	text: string;
+	originalIndices: number[];
+}
+
+function normalizeTrailingWhitespace(value: string): NormalizedText {
+	let text = "";
+	const originalIndices: number[] = [];
+	let lineStart = 0;
+
+	while (lineStart < value.length) {
+		const newline = value.indexOf("\n", lineStart);
+		const lineEnd = newline === -1 ? value.length : newline;
+		const trimmedLength = value.slice(lineStart, lineEnd).trimEnd().length;
+		const contentEnd = lineStart + trimmedLength;
+
+		for (let index = lineStart; index < contentEnd; index++) {
+			text += value[index];
+			originalIndices.push(index);
+		}
+
+		if (newline === -1) break;
+		text += "\n";
+		originalIndices.push(newline);
+		lineStart = newline + 1;
+	}
+
+	return { text, originalIndices };
+}
+
+function findNormalizedBlock(
+	haystack: string,
+	needle: string,
+	offset: number,
+): BlockMatch | undefined {
+	const normalizedNeedle = normalizeTrailingWhitespace(needle).text;
+	const normalizedHaystack = normalizeTrailingWhitespace(haystack);
+	if (
+		normalizedNeedle === needle &&
+		normalizedHaystack.text === haystack
+	) {
+		return undefined;
+	}
+
+	let normalizedOffset = normalizedHaystack.originalIndices.findIndex(
+		(index) => index >= offset,
+	);
+	if (normalizedOffset === -1) normalizedOffset = normalizedHaystack.text.length;
+
+	const normalizedPos = normalizedHaystack.text.indexOf(
+		normalizedNeedle,
+		normalizedOffset,
+	);
+	if (normalizedPos === -1 || normalizedNeedle.length === 0) return undefined;
+
+	const pos = normalizedHaystack.originalIndices[normalizedPos];
+	const lastNormalizedIndex = normalizedPos + normalizedNeedle.length - 1;
+	const lastOriginalIndex =
+		normalizedHaystack.originalIndices[lastNormalizedIndex];
+	const end = normalizedNeedle.endsWith("\n")
+		? lastOriginalIndex + 1
+		: (() => {
+			const newline = haystack.indexOf("\n", lastOriginalIndex);
+			return newline === -1 ? haystack.length : newline;
+		})();
+
+	return { pos, matchLength: end - pos };
+}
+
 function findBlock(
-  haystack: string,
-  needle: string,
-  offset: number,
-): { pos: number; matchLength: number } | undefined {
-  const exact = haystack.indexOf(needle, offset);
-  if (exact !== -1) return { pos: exact, matchLength: needle.length };
+	haystack: string,
+	needle: string,
+	offset: number,
+): BlockMatch | undefined {
+	const exact = haystack.indexOf(needle, offset);
+	if (exact !== -1) return { pos: exact, matchLength: needle.length };
+	return findNormalizedBlock(haystack, needle, offset);
+}
 
-  // trimEnd pass: strip trailing whitespace per line on both sides.
-  const trimLine = (s: string) =>
-    s
-      .split("\n")
-      .map((l) => l.trimEnd())
-      .join("\n");
+function isEndOfFilePosition(content: string, end: number): boolean {
+	const remaining = content.slice(end);
+	return remaining === "" || remaining === "\n" || remaining === "\r\n";
+}
 
-  const normNeedle = trimLine(needle);
-  const normHaystack = trimLine(haystack);
-  if (normNeedle === needle && normHaystack === haystack) return undefined;
+function findBlockAtEnd(
+	haystack: string,
+	needle: string,
+	offset: number,
+): BlockMatch | undefined {
+	let searchFrom = offset;
+	while (searchFrom <= haystack.length) {
+		const match = findBlock(haystack, needle, searchFrom);
+		if (match === undefined) return undefined;
+		if (isEndOfFilePosition(haystack, match.pos + match.matchLength)) {
+			return match;
+		}
 
-  const normPos = normHaystack.indexOf(normNeedle, offset);
-  if (normPos === -1) return undefined;
+		// Exact matching intentionally wins for ordinary hunks. For EOF hunks,
+		// retry the same occurrence with its trailing whitespace included before
+		// moving past it, so `old  ` at EOF is not mistaken for a middle match.
+		const normalizedMatch = findNormalizedBlock(haystack, needle, match.pos);
+		if (
+			normalizedMatch !== undefined &&
+			normalizedMatch.pos === match.pos &&
+			isEndOfFilePosition(
+				haystack,
+				normalizedMatch.pos + normalizedMatch.matchLength,
+			)
+		) {
+			return normalizedMatch;
+		}
 
-  // Map normalised position back to original haystack. Because trimEnd only
-  // removes characters (never adds), character positions can only shift
-  // right. Walk original lines to find the real byte offset for the matched
-  // line index.
-  const normPrefix = normHaystack.slice(0, normPos);
-  const startLineIdx = normPrefix.split("\n").length - 1;
-
-  const origLines = haystack.split("\n");
-  let realPos = 0;
-  for (let i = 0; i < startLineIdx; i++) realPos += origLines[i].length + 1;
-
-  // Compute the real length: count original bytes for the matched lines.
-  const matchedLineCount = normNeedle.split("\n").length;
-  let realEnd = realPos;
-  for (let i = startLineIdx; i < startLineIdx + matchedLineCount; i++) {
-    realEnd += origLines[i].length + 1;
-  }
-  realEnd--; // exclude trailing \n after last line
-
-  // If the needle ended with \n, include it.
-  if (needle.endsWith("\n") && realEnd + 1 <= haystack.length) realEnd++;
-
-  return { pos: realPos, matchLength: realEnd - realPos };
+		const nextSearch = match.pos + Math.max(match.matchLength, 1);
+		if (nextSearch <= searchFrom) return undefined;
+		searchFrom = nextSearch;
+	}
+	return undefined;
 }
 
 function applyHunks(filePath: string, content: string, hunks: Hunk[]): string {
-  let result = content;
-  let cursor = 0;
+	let result = content;
+	let cursor = 0;
 
-  for (const hunk of hunks) {
-    let searchFrom = cursor;
+	for (const hunk of hunks) {
+		let searchFrom = cursor;
 
-    if (hunk.contextPrefix !== undefined) {
-      const ctxMatch = findBlock(result, hunk.contextPrefix, searchFrom);
-      if (ctxMatch === undefined) {
-        throw new Error(
-          `Failed to find context '${hunk.contextPrefix}' in ${filePath}`,
-        );
-      }
-      searchFrom = ctxMatch.pos + ctxMatch.matchLength;
-    }
+		if (hunk.contextPrefix !== undefined) {
+			const ctxMatch = findBlock(result, hunk.contextPrefix, searchFrom);
+			if (ctxMatch === undefined) {
+				throw new Error(
+					`Failed to find context '${hunk.contextPrefix}' in ${filePath}`,
+				);
+			}
+			searchFrom = ctxMatch.pos + ctxMatch.matchLength;
+		}
 
-    if (hunk.oldBlock === "") {
-      // Pure insertion: append newBlock at the anchor (or end-of-file).
-      const insertAt =
-        hunk.contextPrefix !== undefined ? searchFrom : result.length;
-      const needsNewline = insertAt > 0 && result[insertAt - 1] !== "\n";
-      const prefix = needsNewline ? "\n" : "";
-      result =
-        result.slice(0, insertAt) +
-        prefix +
-        hunk.newBlock +
-        result.slice(insertAt);
-      cursor = insertAt + prefix.length + hunk.newBlock.length;
-      continue;
-    }
+		if (hunk.oldBlock === "") {
+			// Pure insertion: append at the anchor, or at EOF when unanchored.
+			const insertAt =
+				hunk.contextPrefix !== undefined ? searchFrom : result.length;
+			if (hunk.endOfFile && !isEndOfFilePosition(result, insertAt)) {
+				throw new Error(
+					`Failed to find expected lines in ${filePath}: insertion does not reach the end of the file`,
+				);
+			}
+			const needsNewline = insertAt > 0 && result[insertAt - 1] !== "\n";
+			const prefix = needsNewline ? "\n" : "";
+			result =
+				result.slice(0, insertAt) +
+				prefix +
+				hunk.newBlock +
+				result.slice(insertAt);
+			cursor = insertAt + prefix.length + hunk.newBlock.length;
+			continue;
+		}
 
-    const match = findBlock(result, hunk.oldBlock, searchFrom);
-    if (match === undefined) {
-      throw new Error(
-        `Failed to find expected lines in ${filePath}:\n${hunk.oldBlock}`,
-      );
-    }
+		const match = hunk.endOfFile
+			? findBlockAtEnd(result, hunk.oldBlock, searchFrom)
+			: findBlock(result, hunk.oldBlock, searchFrom);
+		if (match === undefined) {
+			throw new Error(
+				`Failed to find expected lines in ${filePath}:\n${hunk.oldBlock}`,
+			);
+		}
 
-    result =
-      result.slice(0, match.pos) +
-      hunk.newBlock +
-      result.slice(match.pos + match.matchLength);
-    cursor = match.pos + hunk.newBlock.length;
-  }
+		result =
+			result.slice(0, match.pos) +
+			hunk.newBlock +
+			result.slice(match.pos + match.matchLength);
+		cursor = match.pos + hunk.newBlock.length;
+	}
 
-  // Preserve the "file ends with newline" invariant upstream relies on.
-  if (!result.endsWith("\n")) {
-    result = `${result}\n`;
-  }
+	// Preserve the "file ends with newline" invariant upstream relies on.
+	if (!result.endsWith("\n")) {
+		result = `${result}\n`;
+	}
 
-  return result;
+	return result;
 }
 
 // ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
+
+async function checkWriteAccess(
+  workspace: Workspace,
+  absolutePaths: readonly string[],
+): Promise<void> {
+  await Promise.all(
+    Array.from(new Set(absolutePaths), (absolutePath) =>
+      workspace.checkWriteAccess(absolutePath),
+    ),
+  );
+}
 
 function resolvePatchPath(cwd: string, filePath: string): string {
   const trimmed = filePath.trim();
@@ -392,6 +576,8 @@ export async function applyPatchOperations(
             ? await workspace.readText(abs)
             : "";
         const newText = ensureTrailingNewline(op.contents);
+        // `abs` may not exist yet; the file-or-parent check handles that.
+        await checkWriteAccess(workspace, [abs]);
         await workspace.writeText(abs, newText);
         results.push(
           buildOpResult(
@@ -411,6 +597,7 @@ export async function applyPatchOperations(
           throw new Error(`Failed to delete ${op.path}: file does not exist`);
         }
         const oldText = collectDiff ? await workspace.readText(abs) : "";
+        await checkWriteAccess(workspace, [abs]);
         await workspace.deleteFile(abs);
         results.push(
           buildOpResult(
@@ -425,10 +612,50 @@ export async function applyPatchOperations(
       }
 
       case "update": {
-        const abs = resolvePatchPath(cwd, op.path);
-        const sourceText = await workspace.readText(abs);
+        const source = resolvePatchPath(cwd, op.path);
+        if (op.moveTo !== undefined) {
+          const destination = resolvePatchPath(cwd, op.moveTo);
+          if (source === destination) {
+            throw new Error(
+              `Failed to move ${op.path}: source and destination must be different`,
+            );
+          }
+          if (!(await workspace.exists(source))) {
+            throw new Error(
+              `Failed to move ${op.path}: source file does not exist`,
+            );
+          }
+
+          const sourceText = await workspace.readText(source);
+          const updated = applyHunks(op.path, sourceText, op.hunks);
+          if (await workspace.exists(destination)) {
+            throw new Error(
+              `Failed to move ${op.path} to ${op.moveTo}: destination already exists`,
+            );
+          }
+
+          await checkWriteAccess(workspace, [source, destination]);
+          // A successful destination write followed by a failed source delete
+          // is intentionally not compensated; virtual preflight covers the
+          // validation failures before real mutation starts.
+          await workspace.writeText(destination, updated);
+          await workspace.deleteFile(source);
+          results.push(
+            buildOpResult(
+              op.path,
+              `Moved ${op.path} to ${op.moveTo}.`,
+              sourceText,
+              updated,
+              collectDiff,
+            ),
+          );
+          break;
+        }
+
+        const sourceText = await workspace.readText(source);
         const updated = applyHunks(op.path, sourceText, op.hunks);
-        await workspace.writeText(abs, updated);
+        await checkWriteAccess(workspace, [source]);
+        await workspace.writeText(source, updated);
         results.push(
           buildOpResult(
             op.path,

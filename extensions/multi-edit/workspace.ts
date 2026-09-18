@@ -1,8 +1,70 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile, unlink as fsUnlink, writeFile as fsWriteFile } from "fs/promises";
+import { dirname } from "path";
+import {
+	access as fsAccess,
+	mkdir as fsMkdir,
+	readFile as fsReadFile,
+	stat as fsStat,
+	unlink as fsUnlink,
+	writeFile as fsWriteFile,
+} from "fs/promises";
 
 import type { Workspace } from "./types.ts";
+
+async function statOrUndefined(absolutePath: string) {
+	try {
+		return await fsStat(absolutePath);
+	} catch (error: unknown) {
+		if (isMissingPathError(error)) return undefined;
+		throw error;
+	}
+}
+
+async function checkDirectoryWriteAccess(dirPath: string): Promise<void> {
+	// Creating or deleting an entry inside a directory requires write+execute
+	// on that directory. Walk up to the nearest existing ancestor so nested
+	// destinations still fail fast during virtual preflight.
+	let dir = dirPath;
+	while (true) {
+		const st = await statOrUndefined(dir);
+		if (st !== undefined) {
+			if (!st.isDirectory()) {
+				throw new Error(`Not a directory: ${dir}`);
+			}
+			await fsAccess(dir, constants.W_OK | constants.X_OK);
+			return;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) return; // reached filesystem root, nothing else to check
+		dir = parent;
+	}
+}
+
+async function checkFileOrParentWriteAccess(absolutePath: string): Promise<void> {
+	const st = await statOrUndefined(absolutePath);
+	if (st === undefined) {
+		// New file: need write+execute on the containing directory.
+		await checkDirectoryWriteAccess(dirname(absolutePath));
+		return;
+	}
+	if (st.isDirectory()) {
+		throw new Error(`Not a file: ${absolutePath}`);
+	}
+	// Existing file: need the file itself writable (for overwrite) and the
+	// containing directory writable+executable (for delete/replace).
+	await fsAccess(absolutePath, constants.R_OK | constants.W_OK);
+	await checkDirectoryWriteAccess(dirname(absolutePath));
+}
+
+function isMissingPathError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		error.code === "ENOENT"
+	);
+}
 
 export function createRealWorkspace(pi: ExtensionAPI): Workspace {
 	const readCache = new Map<string, string>();
@@ -20,6 +82,7 @@ export function createRealWorkspace(pi: ExtensionAPI): Workspace {
 			const existing = readCache.get(absolutePath);
 			if (existing === content) return;
 			readCache.delete(absolutePath);
+			await fsMkdir(dirname(absolutePath), { recursive: true });
 			await fsWriteFile(absolutePath, content, "utf-8");
 			pi.events.emit("context-guard:file-modified", { path: absolutePath });
 		},
@@ -36,7 +99,7 @@ export function createRealWorkspace(pi: ExtensionAPI): Workspace {
 				return false;
 			}
 		},
-		checkWriteAccess: (absolutePath: string) => fsAccess(absolutePath, constants.R_OK | constants.W_OK),
+		checkWriteAccess: checkFileOrParentWriteAccess,
 	};
 }
 
@@ -74,12 +137,16 @@ export function createVirtualWorkspace(cwd: string): Workspace {
 		},
 		exists: async (absolutePath) => {
 			await ensureLoaded(absolutePath);
+			// A file that cannot be reached because its parent directory lacks
+			// execute permission is not "absent"; surface the access error so
+			// delete/move preflights report the real failure instead of
+			// "file does not exist".
+			await checkFileOrParentWriteAccess(absolutePath).catch((error) => {
+				if (isMissingPathError(error)) return;
+				throw error;
+			});
 			return state.get(absolutePath) !== null;
 		},
-		checkWriteAccess: async (absolutePath: string) => {
-			// Check real-fs write permission during the virtual preflight so
-			// that read-only files fail fast *before* any real file is touched.
-			await fsAccess(absolutePath, constants.W_OK);
-		},
+		checkWriteAccess: checkFileOrParentWriteAccess,
 	};
 }

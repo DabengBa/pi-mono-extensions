@@ -7,10 +7,10 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 import { applyClassicEdits } from "./classic.ts";
-import { applyPatchOperations, parsePatch } from "./patch.ts";
+import { APPLY_PATCH_GRAMMAR, applyPatchOperations, parsePatch } from "./patch.ts";
 import type { EditItem } from "./types.ts";
 import { createRealWorkspace, createVirtualWorkspace } from "./workspace.ts";
 
@@ -151,6 +151,14 @@ export default function (pi: ExtensionAPI) {
       "Patch payloads must use *** Begin Patch and *** End Patch delimiters",
     ],
     parameters: applyPatchSchema,
+    // Grammar constrained sampling: providers that support Lark grammar custom
+    // tools constrain apply_patch to the patch language; every other provider
+    // keeps the plain function tool from `parameters` above (pi-ai resolves
+    // this per request, so no model-id capability sniffing is needed).
+    constrainedSampling: {
+      type: "grammar",
+      variants: { openai_lark: APPLY_PATCH_GRAMMAR },
+    },
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const operations = parsePatch(params.patch);

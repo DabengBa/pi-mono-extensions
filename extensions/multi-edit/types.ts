@@ -29,12 +29,13 @@ export interface Hunk {
 	contextPrefix?: string;
 	oldBlock: string;
 	newBlock: string;
+	endOfFile?: boolean;
 }
 
 export type PatchOperation =
 	| { kind: "add"; path: string; contents: string }
 	| { kind: "delete"; path: string }
-	| { kind: "update"; path: string; hunks: Hunk[] };
+	| { kind: "update"; path: string; moveTo?: string; hunks: Hunk[] };
 
 export interface PatchOpResult {
 	path: string;
