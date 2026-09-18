@@ -52,7 +52,7 @@ export const applyPatchSchema = Type.Object(
   {
     patch: Type.String({
       description:
-        "Codex-style patch payload delimited by *** Begin Patch and *** End Patch",
+        "Codex-style patch payload delimited by *** Begin Patch and *** End Patch. Supports Add, Delete, Update, Move to, and End of File operations.",
     }),
   },
   { additionalProperties: false },
@@ -142,13 +142,15 @@ export default function (pi: ExtensionAPI) {
     name: "apply_patch",
     label: "apply_patch",
     description:
-      "Apply a preflighted Codex-style patch that can add, update, or delete files. Use native edit for ordinary replacements.",
+      "Apply a preflighted Codex-style patch that can add, update, delete, or move files, including end-of-file-constrained hunks. Use native edit for ordinary replacements.",
     promptSnippet:
-      "Apply a Codex-style patch for coordinated add, update, or delete operations",
+      "Apply a Codex-style patch for coordinated add, update, delete, move, or end-of-file-constrained operations",
     promptGuidelines: [
       "Use native edit for ordinary single-file replacements",
-      "Use apply_patch for coordinated multi-file changes or file additions/deletions",
+      "Use apply_patch for coordinated multi-file changes, file additions/deletions, file moves, or end-of-file-constrained hunks",
       "Patch payloads must use *** Begin Patch and *** End Patch delimiters",
+      "Place *** Move to: immediately after *** Update File: and before its first hunk",
+      "Place *** End of File after a hunk when that hunk must match through the file end",
     ],
     parameters: applyPatchSchema,
     // Grammar constrained sampling: providers that support Lark grammar custom
