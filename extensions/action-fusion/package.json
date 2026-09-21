@@ -1,0 +1,30 @@
+{
+  "name": "pi-action-fusion",
+  "version": "0.1.0",
+  "description": "Fuse a Pi edit/write mutation with its follow-up verification command into one tool call",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.86.0",
+    "@types/node": "25.6.0",
+    "tsx": "4.23.13",
+    "typebox": "1.3.27",
+    "typescript": "6.0.3"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
