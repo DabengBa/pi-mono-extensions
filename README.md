@@ -8,6 +8,7 @@ You can install the full bundle with one command, or install only the extensions
 
 - [Installation](#installation)
 - [Extensions](#extensions)
+  - [action-fusion](#action-fusion)
   - [ask-user-question](#ask-user-question)
   - [auto-fix](#auto-fix)
   - [btw](#btw)
@@ -45,6 +46,35 @@ pi -e /path/to/pi-extensions/extensions/btw/index.ts
 ```
 
 ## Extensions
+
+### action-fusion
+
+Full details: [extensions/action-fusion/README.md](extensions/action-fusion/README.md).
+
+Keeps Pi's native `edit` and `write` tools while adding an optional `then_run` command so a successful file mutation and its verification can complete in one tool call.
+
+#### Install
+
+```bash
+pi install npm:pi-action-fusion
+```
+
+#### Usage
+
+Add `then_run` to an `edit` or `write` call when the mutation should be verified immediately:
+
+```json
+{
+  "path": "src/app.ts",
+  "content": "export const ready = true;\n",
+  "then_run": {
+    "command": "npm test -- --runInBand",
+    "timeout": 120
+  }
+}
+```
+
+The mutation runs first. Action Fusion checks that the target remains unchanged before invoking Pi's native bash tool, serializes fused operations for the same file, and reports command failures without rolling back the completed mutation. `then_run.command` is arbitrary shell text with the same permissions as the Pi process, so only use trusted commands.
 
 ### ask-user-question
 
